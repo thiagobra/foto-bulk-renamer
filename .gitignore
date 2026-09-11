@@ -32,3 +32,12 @@ google-services.json
 
 # Android Profiling
 *.hprof
+
+# Foto Renamer
+.venv/
+venv/
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
