@@ -4,7 +4,10 @@ A dark, Windows 11-styled desktop app for bulk-renaming phone photos — with a
 live preview of every new name before anything touches disk, and a one-click
 undo if you change your mind.
 
-![Foto Renamer](docs/screenshot.png)
+![Foto Renamer](screenshots/01-new-name-mode.png)
+
+*More views of the app — the other two modes, a custom pattern, the convention warning and
+the post-rename state — are in [`screenshots/`](screenshots/).*
 
 ---
 
@@ -138,6 +141,7 @@ Anything else you drop in is ignored and counted in the status line.
 | `test_renamer.py` | 44 tests. Run: `python -m unittest test_renamer -v` |
 | `make_icon.py` | Regenerates `assets/icon.ico`. |
 | `run.bat` / `build_exe.bat` | Run from source / build the standalone exe. |
+| `screenshots/` | Pictures of the app running, with an index explaining each one. |
 
 ## Troubleshooting
 
