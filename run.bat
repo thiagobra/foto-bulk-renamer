@@ -17,8 +17,24 @@ if not exist ".venv" (
     call ".venv\Scripts\activate.bat"
     python -m pip install --upgrade pip >nul
     pip install -r requirements.txt
+    if errorlevel 1 (
+        echo.
+        echo Setup FAILED - scroll up for the reason.
+        echo A missing internet connection is the usual cause.
+        pause
+        exit /b 1
+    )
 ) else (
     call ".venv\Scripts\activate.bat"
 )
 
 python app.py
+
+REM Without this, a start-up error would flash past and the window would
+REM close before anyone could read it.
+if errorlevel 1 (
+    echo.
+    echo Foto Renamer stopped with an error - the reason is just above.
+    pause
+    exit /b 1
+)

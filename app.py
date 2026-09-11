@@ -144,6 +144,7 @@ class FotoRenamer:
         self._row_paths: list[Path] = []         # tree row order
 
         self.settings_file = renamer.app_data_dir() / "settings.json"
+        self._restored_geometry = False
         self._make_variables()
         self._load_settings()
         self._build_styles()
@@ -154,6 +155,7 @@ class FotoRenamer:
         self.root.after(120, self._poll_thumbnails)
         self._on_preset_change()
         self._on_mode_change()
+        self._on_insert_position_change()
         self.refresh_preview()
 
     # -- state ------------------------------------------------------------
@@ -225,6 +227,7 @@ class FotoRenamer:
         if isinstance(data.get("geometry"), str):
             try:
                 self.root.geometry(data["geometry"])
+                self._restored_geometry = True
             except tk.TclError:
                 pass
 
@@ -302,7 +305,9 @@ class FotoRenamer:
         self.root.title("Foto Renamer")
         self.root.configure(background=BG)
         self.root.minsize(1010, 720)
-        if not self.root.winfo_geometry().startswith("1"):
+        # winfo_geometry() is "1x1+0+0" until the window is mapped, so it
+        # cannot be used to tell "no size yet" from "restored size".
+        if not self._restored_geometry:
             self.root.geometry("1200x950")
 
         self.root.columnconfigure(0, weight=1)
@@ -749,7 +754,9 @@ class FotoRenamer:
             mode=Mode(self.var_mode.get()),
             pattern=self.var_pattern.get(),
             event=self.var_event.get(),
-            start=whole(self.var_start, 1),
+            # The Start spinbox floor is 0; typing a negative by hand would
+            # otherwise put a stray hyphen in every name ("_-05").
+            start=max(0, whole(self.var_start, 1)),
             digits=whole(self.var_digits, 3),
             insert_text=self.var_insert_text.get(),
             insert_position=INSERT_LABELS.get(self.var_insert_at.get(),
@@ -956,7 +963,7 @@ class FotoRenamer:
             return
 
         result = renamer.apply_renames(changing)
-        self._apply_name_changes(result.renamed)
+        self._apply_name_changes(result.moved)
         self.var_status.set(
             f"Renamed {len(result.renamed)} file"
             f"{'s' if len(result.renamed) != 1 else ''}"
@@ -972,21 +979,27 @@ class FotoRenamer:
         if not result.renamed and result.errors:
             self.var_status.set(result.errors[0][1] or "Nothing to undo.")
         else:
-            self._apply_name_changes(result.renamed)
+            self._apply_name_changes(result.moved)
             self.var_status.set(f"Undone — {len(result.renamed)} file"
                                 f"{'s' if len(result.renamed) != 1 else ''} restored")
         self._refresh_undo_button()
 
-    def _apply_name_changes(self, pairs: list[tuple[str, str]]) -> None:
-        """Keep our in-memory list pointing at the files' new names."""
-        renamed = dict(pairs)
+    def _apply_name_changes(self, moves: list[tuple[Path, Path]]) -> None:
+        """Keep our in-memory list pointing at the files' new names.
+
+        Keyed on the full path: two folders in one batch can easily both
+        contain an IMG_0001.jpg, and matching on the bare name would point
+        both rows at the same file.
+        """
+        moved = {old.resolve(): new for old, new in moves}
         for photo in self.files:
-            new_name = renamed.get(photo.name)
-            if not new_name:
+            resolved = photo.path.resolve()
+            new_path = moved.get(resolved)
+            if new_path is None:
                 continue
-            was_checked = photo.path.resolve() in self.checked
-            self.checked.discard(photo.path.resolve())
-            photo.path = photo.path.with_name(new_name)
+            was_checked = resolved in self.checked
+            self.checked.discard(resolved)
+            photo.path = new_path
             if was_checked:
                 self.checked.add(photo.path.resolve())
         self.files = renamer.sort_files(self.files)

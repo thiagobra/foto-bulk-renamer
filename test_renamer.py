@@ -406,6 +406,109 @@ class TestDiskOperations(unittest.TestCase):
         self.assertEqual(undone.renamed, [])
         self.assertIn("skipped", undone.errors[0][1])
 
+    def test_result_carries_absolute_paths(self):
+        write_jpeg(self.dir / "IMG_0001.jpg", exif_date="2026:06:12 14:22:33")
+        files, _ = renamer.scan_paths([self.dir])
+        result = renamer.apply_renames(
+            renamer.plan_renames(files, RenameSettings(event="beach")))
+        self.assertEqual(len(result.moved), 1)
+        old, new = result.moved[0]
+        self.assertTrue(old.is_absolute() and new.is_absolute())
+        self.assertEqual(new.name, "2026-06-12_beach_001.jpg")
+
+    def test_two_folders_with_the_same_file_name_survive_undo(self):
+        """A batch spanning two cards: both hold an IMG_0001.jpg.
+
+        Identifying files by their bare name used to collapse the two into
+        one, which corrupted the undo log and stranded the first folder.
+        """
+        one, two = self.dir / "one", self.dir / "two"
+        one.mkdir(), two.mkdir()
+        for folder in (one, two):
+            write_jpeg(folder / "IMG_0001.jpg", exif_date="2026:06:12 14:22:33")
+
+        files = renamer.sort_files(renamer.scan_paths([one, two])[0])
+        result = renamer.apply_renames(
+            renamer.plan_renames(files, RenameSettings(event="beach")))
+
+        self.assertEqual(result.errors, [])
+        self.assertEqual(len(result.renamed), 2)
+        self.assertEqual([p.name for p in sorted(one.iterdir())],
+                         ["2026-06-12_beach_001.jpg"])
+        self.assertEqual([p.name for p in sorted(two.iterdir())],
+                         ["2026-06-12_beach_002.jpg"])
+
+        # The log must name both folders, not the same one twice.
+        pairs = json.loads(result.log_path.read_text())["pairs"]
+        self.assertEqual({str(Path(old).parent) for old, _new in pairs},
+                         {str(one), str(two)})
+
+        undone = renamer.undo_last()
+        self.assertEqual(undone.errors, [])
+        self.assertTrue((one / "IMG_0001.jpg").exists())
+        self.assertTrue((two / "IMG_0001.jpg").exists())
+
+    def test_one_unreachable_file_does_not_abort_the_batch(self):
+        """README promise: the rest of the batch still completes."""
+        for name in ("a.jpg", "b.jpg", "c.jpg"):
+            write_jpeg(self.dir / name, exif_date="2026:06:12 14:22:33")
+        files = renamer.sort_files(renamer.scan_paths([self.dir])[0])
+        plans = renamer.plan_renames(files, RenameSettings(event="trip"))
+        (self.dir / "b.jpg").unlink()          # vanished after the preview
+
+        result = renamer.apply_renames(plans)
+
+        self.assertEqual(len(result.renamed), 2)
+        self.assertEqual(len(result.errors), 1)
+        self.assertEqual(result.errors[0][0], "b.jpg")
+        self.assertFalse([n for n in self.listing() if renamer.TEMP_SUFFIX in n])
+
+    def test_a_file_that_cannot_move_is_never_overwritten(self):
+        """POSIX rename() overwrites silently, so the mover must refuse."""
+        (self.dir / "a.jpg").write_bytes(b"AAAA")
+        (self.dir / "b.jpg").write_bytes(b"BBBB")
+
+        real_rename = Path.rename
+
+        def locked(self, target):
+            if self.name == "a.jpg":
+                raise OSError(13, "Permission denied")
+            return real_rename(self, target)
+
+        Path.rename = locked
+        try:
+            result = renamer._two_phase_move(
+                [(self.dir / "a.jpg", self.dir / "b.jpg"),
+                 (self.dir / "b.jpg", self.dir / "a.jpg")])
+        finally:
+            Path.rename = real_rename
+
+        self.assertEqual((self.dir / "a.jpg").read_bytes(), b"AAAA")
+        self.assertEqual((self.dir / "b.jpg").read_bytes(), b"BBBB")
+        self.assertEqual(result.renamed, [])
+        self.assertTrue(any("still taken" in why for _name, why in result.errors))
+        self.assertFalse([n for n in self.listing() if renamer.TEMP_SUFFIX in n])
+
+    def test_a_stranded_temp_file_is_named_in_the_error(self):
+        """If even the restore fails, say where the file actually is."""
+        write_jpeg(self.dir / "a.jpg", exif_date="2026:06:12 14:22:33")
+        real_rename = Path.rename
+
+        def fails_after_staging(self, target):
+            if renamer.TEMP_SUFFIX in self.name:      # forward move and restore
+                raise OSError(13, "Permission denied")
+            return real_rename(self, target)
+
+        Path.rename = fails_after_staging
+        try:
+            result = renamer._two_phase_move(
+                [(self.dir / "a.jpg", self.dir / "b.jpg")])
+        finally:
+            Path.rename = real_rename
+
+        self.assertEqual(result.renamed, [])
+        self.assertIn(renamer.TEMP_SUFFIX, result.errors[0][1])
+
     def test_undo_log_contains_absolute_pairs(self):
         write_jpeg(self.dir / "IMG_0001.jpg", exif_date="2026:06:12 14:22:33")
         files, _ = renamer.scan_paths([self.dir])

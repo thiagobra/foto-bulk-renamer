@@ -435,9 +435,14 @@ def plan_renames(files: list[PhotoFile], settings: RenameSettings) -> list[Renam
 
 @dataclass
 class RenameResult:
+    # (old name, new name) — for the status line and the file list.
     renamed: list[tuple[str, str]] = field(default_factory=list)
     errors: list[tuple[str, str]] = field(default_factory=list)
     log_path: Path | None = None
+    # The same moves as absolute paths. Names alone are ambiguous once a
+    # batch spans two folders (two cards can both hold an IMG_0001.jpg),
+    # so everything that has to identify a file uses these.
+    moved: list[tuple[Path, Path]] = field(default_factory=list)
 
 
 def app_data_dir() -> Path:
@@ -460,38 +465,56 @@ def history_dir() -> Path:
 def _two_phase_move(moves: list[tuple[Path, Path]]) -> RenameResult:
     """Rename via temporary names so a full reshuffle (or an A<->B swap) is safe.
 
-    Phase 1 moves every file to a unique temp name; if that fails we put
-    everything back. Phase 2 moves the temps to their targets; a single
-    failure there (file locked, permission denied) is reported and that one
-    file is restored, while the rest still complete.
+    Phase 1 moves every file to a unique temp name. A file that cannot be
+    moved out of the way — open in another app, read-only, or deleted since
+    the preview was built — is reported and skipped, and the rest of the
+    batch still completes. Phase 2 moves the temps to their targets; a
+    single failure there is reported and that one file is restored.
     """
     result = RenameResult()
     staged: list[tuple[Path, Path, Path]] = []   # (temp, target, original)
+    blocked: set[Path] = set()   # names a skipped file is still sitting on
 
     for i, (src, dst) in enumerate(moves):
         temp = src.with_name(f"{src.name}{TEMP_SUFFIX}{i}")
         try:
             src.rename(temp)
         except OSError as exc:
-            for temp_path, _dst, original in staged:   # roll phase 1 back
-                try:
-                    temp_path.rename(original)
-                except OSError:
-                    pass
             result.errors.append((src.name, str(exc)))
-            return result
+            if src.exists():
+                # Still there, just out of reach: nothing may take its name.
+                blocked.add(src.resolve())
+            continue
         staged.append((temp, dst, src))
 
     for temp, dst, original in staged:
-        try:
-            temp.rename(dst)
-            result.renamed.append((original.name, dst.name))
-        except OSError as exc:
-            result.errors.append((original.name, str(exc)))
+        if dst.resolve() in blocked:
+            # POSIX rename() would silently overwrite the file we could not
+            # move, so refuse this one rather than destroy it.
+            result.errors.append(
+                (original.name,
+                 f"{dst.name} is still taken by a file that could not be renamed"))
             try:
                 temp.rename(original)
             except OSError:
-                pass
+                result.errors.append(
+                    (original.name, f"is currently named {temp.name}"))
+            continue
+        try:
+            temp.rename(dst)
+            result.renamed.append((original.name, dst.name))
+            result.moved.append((original, dst))
+        except OSError as exc:
+            # Put this one back under its original name. If even that fails
+            # the file is still on disk under its temporary name, so say so
+            # instead of reporting it as if nothing had happened to it.
+            try:
+                temp.rename(original)
+                result.errors.append((original.name, str(exc)))
+            except OSError:
+                result.errors.append(
+                    (original.name,
+                     f"{exc} — the file is currently named {temp.name}"))
     return result
 
 
@@ -503,10 +526,8 @@ def apply_renames(plans: list[RenamePlan], *, write_log: bool = True) -> RenameR
 
     result = _two_phase_move(moves)
 
-    if write_log and result.renamed:
-        directory_by_old = {p.photo.path.name: p.photo.path.parent for p in plans}
-        pairs = [[str(directory_by_old[old] / old), str(directory_by_old[old] / new)]
-                 for old, new in result.renamed]
+    if write_log and result.moved:
+        pairs = [[str(old), str(new)] for old, new in result.moved]
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         log_path = history_dir() / f"{stamp}.json"
         log_path.write_text(json.dumps(
@@ -541,6 +562,7 @@ def undo_last() -> RenameResult:
         moved = _two_phase_move(moves)
         result.renamed.extend(moved.renamed)
         result.errors.extend(moved.errors)
+        result.moved.extend(moved.moved)
 
     # Mark the log as spent so the next undo steps further back in time.
     log_path.rename(log_path.with_suffix(".json.undone"))

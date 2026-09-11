@@ -138,7 +138,7 @@ Anything else you drop in is ignored and counted in the status line.
 | `app.py` | The window — layout, theme, drag & drop, live preview. |
 | `renamer.py` | All the naming rules. No GUI code, so it can be tested on its own. |
 | `presets.py` | The preset table as plain data — add your own in two lines. |
-| `test_renamer.py` | 44 tests. Run: `python -m unittest test_renamer -v` |
+| `test_renamer.py` | 49 tests. Run: `python -m unittest test_renamer -v` |
 | `make_icon.py` | Regenerates `assets/icon.ico`. |
 | `run.bat` / `build_exe.bat` | Run from source / build the standalone exe. |
 | `screenshots/` | Pictures of the app running, with an index explaining each one. |
