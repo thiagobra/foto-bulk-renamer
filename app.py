@@ -746,10 +746,10 @@ class FotoRenamer:
 
     def add_paths(self, paths) -> None:
         found, skipped = renamer.scan_paths(paths)
-        known = {f.path.resolve() for f in self.files}
-        added = [f for f in found if f.path.resolve() not in known]
+        known = {f.resolved for f in self.files}
+        added = [f for f in found if f.resolved not in known]
         self.files = renamer.sort_files(self.files + added)
-        self.checked.update(f.path.resolve() for f in added)
+        self.checked.update(f.resolved for f in added)
 
         notes = [f"{len(added)} added"]
         if skipped:
@@ -763,12 +763,16 @@ class FotoRenamer:
         self.refresh_preview()
 
     def remove_selected(self) -> None:
-        doomed = {self._path_for_row(iid) for iid in self.tree.selection()}
+        doomed = [photo for photo in map(self._photo_for_row, self.tree.selection())
+                  if photo is not None]
         if not doomed:
             return
-        self.files = [f for f in self.files if f.path not in doomed]
-        self.checked -= {p.resolve() for p in doomed if p}
-        self.var_status.set(f"{len(doomed)} removed from the list")
+        # Untick before dropping them, while we still hold the PhotoFiles and
+        # can read the resolved path they already worked out.
+        self.checked -= {f.resolved for f in doomed}
+        gone = {f.path for f in doomed}
+        self.files = [f for f in self.files if f.path not in gone]
+        self.var_status.set(f"{len(gone)} removed from the list")
         self._populate_tree()
         self.refresh_preview()
 
@@ -779,17 +783,26 @@ class FotoRenamer:
         self.refresh_preview()
 
     def _set_all(self, value: bool) -> None:
-        self.checked = {f.path.resolve() for f in self.files} if value else set()
+        self.checked = {f.resolved for f in self.files} if value else set()
         self.refresh_preview()
 
     def _invert(self) -> None:
-        everything = {f.path.resolve() for f in self.files}
+        everything = {f.resolved for f in self.files}
         self.checked = everything - self.checked
         self.refresh_preview()
 
     def _path_for_row(self, iid: str) -> Path | None:
         index = int(iid)
         return self._row_paths[index] if 0 <= index < len(self._row_paths) else None
+
+    def _photo_for_row(self, iid: str) -> renamer.PhotoFile | None:
+        """The PhotoFile behind a tree row.
+
+        Row ids are the file's index in self.files (see _populate_tree), so
+        this is a direct lookup rather than a scan for a matching path.
+        """
+        index = int(iid)
+        return self.files[index] if 0 <= index < len(self.files) else None
 
     def _on_tree_click(self, event) -> None:
         if self.tree.identify_region(event.x, event.y) != "cell":
@@ -805,10 +818,10 @@ class FotoRenamer:
 
     def _toggle_rows(self, iids) -> None:
         for iid in iids:
-            path = self._path_for_row(iid)
-            if path is None:
+            photo = self._photo_for_row(iid)
+            if photo is None:
                 continue
-            resolved = path.resolve()
+            resolved = photo.resolved
             if resolved in self.checked:
                 self.checked.discard(resolved)
             else:
@@ -878,7 +891,7 @@ class FotoRenamer:
     def refresh_preview(self) -> None:
         self._preview_job = None
         settings = self.current_settings()
-        ticked = [f for f in self.files if f.path.resolve() in self.checked]
+        ticked = [f for f in self.files if f.resolved in self.checked]
         self.plans = renamer.plan_renames(ticked, settings) if ticked else []
         self.plan_by_path = {p.photo.path: p for p in self.plans}
 
@@ -887,7 +900,7 @@ class FotoRenamer:
             if not self.tree.exists(iid):
                 continue
             plan = self.plan_by_path.get(photo.path)
-            is_checked = photo.path.resolve() in self.checked
+            is_checked = photo.resolved in self.checked
             tags = ["stripe"] if index % 2 else []
             if not is_checked:
                 tags.append("unticked")
@@ -901,7 +914,7 @@ class FotoRenamer:
                            values=("☑" if is_checked else "☐",
                                    photo.name,
                                    plan.new_name if plan else "—",
-                                   photo.taken_at.strftime("%d %b %Y %H:%M")))
+                                   photo.date_display))
 
         changing = [p for p in self.plans if p.changed]
         self.var_counts.set(f"{len(self.files)} files · {len(self.plans)} ticked")
@@ -946,13 +959,7 @@ class FotoRenamer:
 
     def _selected_photo(self) -> renamer.PhotoFile | None:
         selection = self.tree.selection()
-        if not selection:
-            return None
-        path = self._path_for_row(selection[0])
-        for photo in self.files:
-            if photo.path == path:
-                return photo
-        return None
+        return self._photo_for_row(selection[0]) if selection else None
 
     def _update_preview_labels(self) -> None:
         photo = self._selected_photo()
@@ -1116,17 +1123,19 @@ class FotoRenamer:
         contain an IMG_0001.jpg, and matching on the bare name would point
         both rows at the same file.
         """
+        # These resolve() calls happen once per rename, not per keystroke, so
+        # they stay: the moves come back from disk as plain paths.
         moved = {old.resolve(): new for old, new in moves}
         for photo in self.files:
-            resolved = photo.path.resolve()
+            resolved = photo.resolved
             new_path = moved.get(resolved)
             if new_path is None:
                 continue
             was_checked = resolved in self.checked
             self.checked.discard(resolved)
-            photo.path = new_path
+            photo.relocate(new_path)
             if was_checked:
-                self.checked.add(photo.path.resolve())
+                self.checked.add(photo.resolved)
         self.files = renamer.sort_files(self.files)
         self._populate_tree()
         self.refresh_preview()

@@ -91,6 +91,41 @@ class PhotoFile:
     size: int
     from_exif: bool = False
 
+    # Derived once, in __post_init__. resolve() is a realpath syscall; strftime
+    # and natural_key are pure but used to be recomputed for every row on every
+    # keystroke. Caching the three here is what makes the live preview cost
+    # depend on how many photos you are renaming rather than on how many files
+    # happen to share the folder.
+    #
+    # init=False keeps the constructor signature exactly as it was, so tests
+    # that build a PhotoFile for a path that does not exist still work:
+    # resolve() is non-strict and returns an absolute path for a missing file.
+    resolved: Path = field(init=False, repr=False, compare=False)
+    date_display: str = field(init=False, repr=False, compare=False)
+    sort_key: tuple = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        self._refresh_derived()
+
+    def relocate(self, new_path: Path) -> None:
+        """Point this file at its new name after a rename or an undo.
+
+        Always use this instead of assigning to .path — it is what keeps the
+        derived fields from silently going stale.
+        """
+        self.path = new_path
+        self._refresh_derived()
+
+    def set_taken_at(self, taken_at: datetime, *, from_exif: bool) -> None:
+        """Record a capture date read later (the background EXIF backfill)."""
+        self.taken_at, self.from_exif = taken_at, from_exif
+        self._refresh_derived()
+
+    def _refresh_derived(self) -> None:
+        self.resolved = self.path.resolve()
+        self.date_display = self.taken_at.strftime("%d %b %Y %H:%M")
+        self.sort_key = (self.taken_at, natural_key(self.path.name))
+
     @property
     def name(self) -> str:
         return self.path.name
@@ -106,13 +141,18 @@ class PhotoFile:
         return self.path.suffix
 
 
-def read_taken_at(path: Path) -> tuple[datetime, bool]:
+def read_taken_at(path: Path, *, use_exif: bool = True) -> tuple[datetime, bool]:
     """Return (date the photo was taken, whether it came from EXIF).
 
     Falls back to the file's modified time, which is what videos and
     screenshots have instead of EXIF.
+
+    use_exif=False skips the Pillow open entirely and goes straight to the
+    modified time. That is not a second code path, just an early exit down the
+    fallback this function already ends on: it lets a big drop appear in the
+    window immediately while the real dates are read on a worker thread.
     """
-    if Image is not None and path.suffix.lower() in IMAGE_EXTS:
+    if use_exif and Image is not None and path.suffix.lower() in IMAGE_EXTS:
         try:
             with Image.open(path) as img:
                 exif = img.getexif()
@@ -143,11 +183,15 @@ def natural_key(text: str) -> list:
             for part in re.split(r"(\d+)", text)]
 
 
-def scan_paths(paths) -> tuple[list[PhotoFile], int]:
+def scan_paths(paths, *, read_exif: bool = True) -> tuple[list[PhotoFile], int]:
     """Turn dropped paths (files or folders) into PhotoFiles.
 
     Returns (files, number_of_skipped_paths). Folders are read one level deep,
     which is what dragging a camera folder in should do.
+
+    read_exif=False fills every date from the file's modified time, which is
+    fast enough to run on the UI thread for thousands of files. The caller is
+    then expected to correct those dates with backfill_exif_dates().
     """
     candidates: list[Path] = []
     skipped = 0
@@ -166,25 +210,30 @@ def scan_paths(paths) -> tuple[list[PhotoFile], int]:
         if p.suffix.lower() not in SUPPORTED_EXTS:
             skipped += 1
             continue
-        resolved = p.resolve()
-        if resolved in seen:
-            continue
-        seen.add(resolved)
         try:
-            taken_at, from_exif = read_taken_at(p)
+            # The plain one-argument call stays the common path; only ask for
+            # the skip when a worker thread is going to correct the dates after.
+            taken_at, from_exif = (read_taken_at(p) if read_exif
+                                   else read_taken_at(p, use_exif=False))
             size = p.stat().st_size
         except OSError:
             # Deleted, unplugged or unreadable between listing and reading it.
             skipped += 1
             continue
-        files.append(PhotoFile(path=p, taken_at=taken_at,
-                               size=size, from_exif=from_exif))
+        # Build first, then de-duplicate on the resolved path the PhotoFile
+        # already worked out, rather than paying for a second realpath here.
+        photo = PhotoFile(path=p, taken_at=taken_at,
+                          size=size, from_exif=from_exif)
+        if photo.resolved in seen:
+            continue
+        seen.add(photo.resolved)
+        files.append(photo)
     return files, skipped
 
 
 def sort_files(files: list[PhotoFile]) -> list[PhotoFile]:
     """Chronological order, falling back to Explorer-style name order."""
-    return sorted(files, key=lambda f: (f.taken_at, natural_key(f.name)))
+    return sorted(files, key=lambda f: f.sort_key)
 
 
 # --------------------------------------------------------------------------
@@ -458,7 +507,7 @@ def plan_renames(files: list[PhotoFile], settings: RenameSettings) -> list[Renam
     (use sort_files). Nothing here touches the disk except reading directory
     listings to spot collisions.
     """
-    batch = {f.path.resolve() for f in files}
+    batch = {f.resolved for f in files}
     directories = {f.path.parent for f in files}
     taken = _existing_names(directories, batch)
 
