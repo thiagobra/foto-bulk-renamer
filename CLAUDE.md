@@ -52,6 +52,19 @@ every new name before anything touches disk and a one-click undo.
 - **Nothing touches disk outside `apply_renames`/`undo_last`.** Planning must stay a pure
   function of (files, settings) so the live preview can run on every keystroke.
 - Run `python -m unittest discover -v -p "test_*.py"` before committing.
+- **Anything that changes what the window looks like ends with fresh screenshots.**
+  A picture in `README.md` or `screenshots/` showing a window that no longer exists is
+  worse than no picture. After any UI change — a new control, a new panel, a changed
+  label, a different state — regenerate them and commit them with the work:
+
+  ```bash
+  xvfb-run -a python tools/gui_drive_full.py shots screenshots   # Linux / CI
+  python tools\gui_drive_full.py shots screenshots               # Windows
+  ```
+
+  Then look at the result before committing it, update the table in
+  `screenshots/README.md` if what a shot shows has changed, and add a scenario to
+  `sc_screenshots()` for any new piece of UI worth a picture of its own.
 
 ## Current work
 
