@@ -962,8 +962,14 @@ class FotoRenamer:
             self.lbl_preview_new.configure(text="")
             return
         plan = self.plan_by_path.get(photo.path)
-        source = "EXIF" if photo.from_exif else "file date"
-        if (not photo.from_exif and photo.ext.lower() in renamer.HEIC_EXTS
+        # Say which clock each row was ranked by, so a file that fell back to
+        # the (unreliable) file date is visible rather than silently misplaced.
+        source = {
+            renamer.DATE_FROM_EXIF: "EXIF",
+            renamer.DATE_FROM_VIDEO: "video metadata",
+        }.get(photo.date_source, "file date")
+        if (photo.date_source == renamer.DATE_FROM_FILE
+                and photo.ext.lower() in renamer.HEIC_EXTS
                 and not renamer.HEIC_SUPPORT):
             source = "file date — install pillow-heif to read HEIC"
         self.lbl_preview_name.configure(text=photo.name)

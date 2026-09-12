@@ -12,7 +12,7 @@ import json
 import os
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from PIL import Image
@@ -55,6 +55,51 @@ def write_jpeg(path: Path, *, exif_date: str | None = None, colour=(70, 90, 120)
         img.save(path, exif=exif)
     else:
         img.save(path)
+
+
+
+# Seconds between 1904-01-01 (QuickTime's epoch) and 1970-01-01 (Unix's).
+QT_EPOCH_OFFSET = 2082844800
+
+
+def _atom(atom_type: bytes, payload: bytes) -> bytes:
+    """One QuickTime atom: [4-byte total size][4-byte type][payload]."""
+    return (8 + len(payload)).to_bytes(4, "big") + atom_type + payload
+
+
+def write_mp4(path: Path, *, created_utc: datetime | None = None,
+              day_string: str | None = None, version: int = 0,
+              raw_creation: int | None = None) -> None:
+    """Create a tiny but structurally real .mp4 carrying a capture date.
+
+    Only the atoms the parser walks are written (ftyp, moov, mvhd, udta/day) -
+    there is no actual video track, which is fine because we never decode one.
+    """
+    if raw_creation is not None:
+        seconds = raw_creation
+    elif created_utc is not None:
+        seconds = int(created_utc.replace(tzinfo=timezone.utc).timestamp()) \
+            + QT_EPOCH_OFFSET
+    else:
+        seconds = 0
+
+    width = 8 if version == 1 else 4
+    mvhd_payload = (
+        bytes([version, 0, 0, 0])            # version + 3 flag bytes
+        + seconds.to_bytes(width, "big")     # creation time
+        + seconds.to_bytes(width, "big")     # modification time
+        + (1000).to_bytes(4, "big")          # timescale
+        + (0).to_bytes(width, "big")         # duration
+    )
+    children = [_atom(b"mvhd", mvhd_payload)]
+    if day_string is not None:
+        text = day_string.encode("utf-8")
+        # day payload: [2-byte text length][2-byte language code][text]
+        day = len(text).to_bytes(2, "big") + (0x15C7).to_bytes(2, "big") + text
+        children.append(_atom(b"udta", _atom(b"\xa9day", day)))
+
+    path.write_bytes(_atom(b"ftyp", b"isom\x00\x00\x02\x00isomiso2")
+                     + _atom(b"moov", b"".join(children)))
 
 
 # --------------------------------------------------------------------------
@@ -737,20 +782,179 @@ class TestScanResilience(unittest.TestCase):
             write_jpeg(ghost)
             # The folder listing succeeds, then the file disappears before we
             # can read it - a card pulled out mid-scan looks exactly like this.
-            real_read = renamer.read_taken_at
+            real_read = renamer.read_capture_date
 
             def vanishing_read(path):
                 if path.name == "b.jpg":
                     raise FileNotFoundError(2, "No such file or directory")
                 return real_read(path)
 
-            renamer.read_taken_at = vanishing_read
+            renamer.read_capture_date = vanishing_read
             try:
                 files, skipped = renamer.scan_paths([directory])
             finally:
-                renamer.read_taken_at = real_read
+                renamer.read_capture_date = real_read
             self.assertEqual([f.name for f in files], ["a.jpg"])
             self.assertEqual(skipped, 1)
+
+
+class TestVideoCaptureDates(unittest.TestCase):
+    """Videos carry no EXIF; their capture date lives in the MP4 container."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    # -- mvhd (the movie header, always present) ---------------------------
+
+    def test_mvhd_v0_date_is_read(self):
+        shot = datetime(2026, 6, 12, 14, 22, 33)
+        path = self.dir / "clip.mp4"
+        write_mp4(path, created_utc=shot)
+        # mvhd is UTC, so the answer is that instant in this machine's zone.
+        expected = datetime.fromtimestamp(
+            shot.replace(tzinfo=timezone.utc).timestamp())
+        self.assertEqual(renamer.read_video_created_at(path), expected)
+
+    def test_mvhd_v1_uses_64_bit_timestamps(self):
+        shot = datetime(2026, 6, 12, 9, 5, 0)
+        path = self.dir / "clip.mov"
+        write_mp4(path, created_utc=shot, version=1)
+        expected = datetime.fromtimestamp(
+            shot.replace(tzinfo=timezone.utc).timestamp())
+        self.assertEqual(renamer.read_video_created_at(path), expected)
+
+    def test_moov_is_found_even_when_it_sits_after_the_video_data(self):
+        # Cameras usually write moov last. A leading ftyp already exercises
+        # the seek-past-an-atom path; this adds a big one in between.
+        path = self.dir / "clip.mp4"
+        write_mp4(path, created_utc=datetime(2026, 6, 12, 14, 22, 33))
+        head, tail = path.read_bytes()[:24], path.read_bytes()[24:]
+        filler = (8 + 4096).to_bytes(4, "big") + b"mdat" + b"\x00" * 4096
+        path.write_bytes(head + filler + tail)
+        self.assertIsNotNone(renamer.read_video_created_at(path))
+
+    # -- day (the atom that also states the camera's UTC offset) -----------
+
+    def test_day_atom_wins_over_mvhd_and_keeps_its_wall_clock(self):
+        path = self.dir / "clip.mp4"
+        write_mp4(path, created_utc=datetime(2020, 1, 1, 0, 0, 0),
+                  day_string="2026-06-12T14:22:33+0100")
+        # 14:22:33 is what the clock said where the camera stood, so those are
+        # the digits we keep - not the same instant shifted into our own zone.
+        self.assertEqual(renamer.read_video_created_at(path),
+                         datetime(2026, 6, 12, 14, 22, 33))
+
+    def test_day_atom_accepts_a_punctuated_offset(self):
+        path = self.dir / "clip.mp4"
+        write_mp4(path, day_string="2026-06-12T14:22:33+01:00")
+        self.assertEqual(renamer.read_video_created_at(path),
+                         datetime(2026, 6, 12, 14, 22, 33))
+
+    def test_day_atom_accepts_zulu_time(self):
+        path = self.dir / "clip.mp4"
+        write_mp4(path, day_string="2026-06-12T14:22:33Z")
+        self.assertEqual(renamer.read_video_created_at(path),
+                         datetime(2026, 6, 12, 14, 22, 33))
+
+    # -- refusing to invent a date ----------------------------------------
+
+    def test_zero_creation_time_is_rejected(self):
+        # Plenty of muxers write 0 when they do not know the date. Trusting
+        # it would date every such clip to 1904 and sort it first.
+        path = self.dir / "clip.mp4"
+        write_mp4(path, raw_creation=0)
+        self.assertIsNone(renamer.read_video_created_at(path))
+
+    def test_absurd_future_date_is_rejected(self):
+        path = self.dir / "clip.mp4"
+        write_mp4(path, raw_creation=0xFFFFFFF0)          # some year in 2140
+        self.assertIsNone(renamer.read_video_created_at(path))
+
+    def test_garbage_bytes_do_not_crash(self):
+        path = self.dir / "clip.mp4"
+        path.write_bytes(b"this is not a video at all, not even close")
+        self.assertIsNone(renamer.read_video_created_at(path))
+
+    def test_truncated_file_does_not_crash(self):
+        path = self.dir / "clip.mp4"
+        write_mp4(path, created_utc=datetime(2026, 6, 12, 14, 22, 33))
+        path.write_bytes(path.read_bytes()[:14])          # cut mid-header
+        self.assertIsNone(renamer.read_video_created_at(path))
+
+    def test_empty_file_does_not_crash(self):
+        path = self.dir / "clip.mp4"
+        path.write_bytes(b"")
+        self.assertIsNone(renamer.read_video_created_at(path))
+
+    def test_atom_claiming_to_be_larger_than_the_file_is_refused(self):
+        path = self.dir / "clip.mp4"
+        path.write_bytes((999999).to_bytes(4, "big") + b"moov" + b"\x00" * 16)
+        self.assertIsNone(renamer.read_video_created_at(path))
+
+    # -- how the rest of the app sees it -----------------------------------
+
+    def test_video_without_metadata_falls_back_to_the_file_date(self):
+        path = self.dir / "clip.mp4"
+        write_mp4(path, raw_creation=0)
+        stamp, source = renamer.read_capture_date(path)
+        self.assertEqual(source, renamer.DATE_FROM_FILE)
+        self.assertEqual(stamp,
+                         datetime.fromtimestamp(path.stat().st_mtime))
+
+    def test_read_taken_at_still_means_specifically_exif(self):
+        # The old two-value helper must not start claiming videos are EXIF.
+        path = self.dir / "clip.mp4"
+        write_mp4(path, day_string="2026-06-12T14:22:33Z")
+        _, from_exif = renamer.read_taken_at(path)
+        self.assertFalse(from_exif)
+
+
+class TestOneTimelineAcrossFormats(unittest.TestCase):
+    """The payoff: photos and videos ranked together by when they were taken."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_a_video_sorts_between_the_photos_it_was_shot_between(self):
+        write_jpeg(self.dir / "IMG_0001.jpg", exif_date="2026:06:12 14:00:00")
+        write_mp4(self.dir / "MVI_0002.mp4", day_string="2026-06-12T14:30:00Z")
+        write_jpeg(self.dir / "IMG_0003.jpg", exif_date="2026:06:12 15:00:00")
+        files, _ = renamer.scan_paths([self.dir])
+        self.assertEqual([f.name for f in renamer.sort_files(files)],
+                         ["IMG_0001.jpg", "MVI_0002.mp4", "IMG_0003.jpg"])
+
+    def test_the_numbering_follows_that_single_timeline(self):
+        # Names deliberately disagree with the shooting order, so only the
+        # embedded dates can produce the right sequence.
+        write_jpeg(self.dir / "zz_last.jpg", exif_date="2026:06:12 15:00:00")
+        write_mp4(self.dir / "mm_middle.mp4", day_string="2026-06-12T14:30:00Z")
+        write_jpeg(self.dir / "aa_first.jpg", exif_date="2026:06:12 14:00:00")
+        files, _ = renamer.scan_paths([self.dir])
+        plans = renamer.plan_renames(
+            renamer.sort_files(files),
+            renamer.RenameSettings(pattern="{n}_{orig}", digits=2))
+        self.assertEqual([plan.new_name for plan in plans],
+                         ["01_aa_first.jpg",
+                          "02_mm_middle.mp4",
+                          "03_zz_last.jpg"])
+
+    def test_each_file_reports_where_its_date_came_from(self):
+        write_jpeg(self.dir / "shot.jpg", exif_date="2026:06:12 14:00:00")
+        write_jpeg(self.dir / "screenshot.png")           # no EXIF at all
+        write_mp4(self.dir / "clip.mp4", day_string="2026-06-12T14:30:00Z")
+        sources = {f.name: f.date_source
+                   for f in renamer.scan_paths([self.dir])[0]}
+        self.assertEqual(sources["shot.jpg"], renamer.DATE_FROM_EXIF)
+        self.assertEqual(sources["clip.mp4"], renamer.DATE_FROM_VIDEO)
+        self.assertEqual(sources["screenshot.png"], renamer.DATE_FROM_FILE)
 
 
 if __name__ == "__main__":

@@ -20,7 +20,7 @@ import re
 import sys
 import unicodedata
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 
@@ -82,6 +82,12 @@ DEDUPE_ROOM = 6
 # 1. A file on disk, as data
 # --------------------------------------------------------------------------
 
+# Where a file's capture date came from. The whole point of the app is to rank
+# files by WHEN THEY WERE TAKEN, so these are ordered best-to-worst:
+DATE_FROM_EXIF = "exif"    # stills: written by the camera at the shutter press
+DATE_FROM_VIDEO = "video"  # videos: written by the camera into the container
+DATE_FROM_FILE = "file"    # neither: the filesystem's mtime, a weak last resort
+
 @dataclass
 class PhotoFile:
     """One file the user dropped in, plus the facts we need to rename it."""
@@ -90,6 +96,9 @@ class PhotoFile:
     taken_at: datetime
     size: int
     from_exif: bool = False
+    # Where taken_at came from: one of the DATE_FROM_* constants below. The
+    # ranking is only as trustworthy as this, so the UI shows it per file.
+    date_source: str = DATE_FROM_FILE
 
     @property
     def name(self) -> str:
@@ -106,35 +115,237 @@ class PhotoFile:
         return self.path.suffix
 
 
-def read_taken_at(path: Path) -> tuple[datetime, bool]:
-    """Return (date the photo was taken, whether it came from EXIF).
+def read_exif_taken_at(path: Path) -> datetime | None:
+    """Capture date from a photo's EXIF header, or None if it has none."""
+    if Image is None or path.suffix.lower() not in IMAGE_EXTS:
+        return None
+    try:
+        with Image.open(path) as img:
+            exif = img.getexif()
+            # Real cameras write DateTimeOriginal (36867) into the Exif
+            # sub-IFD (0x8769), and usually DateTime (306) into IFD0 too.
+            candidates = [
+                exif.get_ifd(0x8769).get(36867),   # when the shutter fired
+                exif.get(306),                     # when the file was written
+                exif.get(36867),                   # some apps write it here
+            ]
+            for raw in candidates:
+                if raw:
+                    text = str(raw).strip()
+                    for fmt in ("%Y:%m:%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+                        try:
+                            return datetime.strptime(text, fmt)
+                        except ValueError:
+                            continue
+    except Exception:
+        # A corrupt or unreadable header must never stop the app.
+        pass
+    return None
 
-    Falls back to the file's modified time, which is what videos and
-    screenshots have instead of EXIF.
+
+def read_capture_date(path: Path) -> tuple[datetime, str]:
+    """Return (when this file was captured, which source that came from).
+
+    This is the single entry point the app uses, and it is deliberately
+    format-agnostic: a .jpg and a .mov dropped in together both come back
+    with a real capture time, so sort_files() can rank them on one timeline.
+
+    Order of trust: the camera's own metadata first (EXIF for stills, the
+    container header for video), the filesystem's modified time only as a
+    last resort — copying, importing or cloud-syncing a file rewrites mtime,
+    which is exactly how holiday photos end up ordered by download time.
     """
-    if Image is not None and path.suffix.lower() in IMAGE_EXTS:
-        try:
-            with Image.open(path) as img:
-                exif = img.getexif()
-                # Real cameras write DateTimeOriginal (36867) into the Exif
-                # sub-IFD (0x8769), and usually DateTime (306) into IFD0 too.
-                candidates = [
-                    exif.get_ifd(0x8769).get(36867),   # when the shutter fired
-                    exif.get(306),                     # when the file was written
-                    exif.get(36867),                   # some apps write it here
-                ]
-                for raw in candidates:
-                    if raw:
-                        text = str(raw).strip()
-                        for fmt in ("%Y:%m:%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
-                            try:
-                                return datetime.strptime(text, fmt), True
-                            except ValueError:
-                                continue
-        except Exception:
-            # A corrupt or unreadable header must never stop the app.
-            pass
-    return datetime.fromtimestamp(path.stat().st_mtime), False
+    stamp = read_exif_taken_at(path)
+    if stamp is not None:
+        return stamp, DATE_FROM_EXIF
+    if path.suffix.lower() in VIDEO_EXTS:
+        stamp = read_video_created_at(path)
+        if stamp is not None:
+            return stamp, DATE_FROM_VIDEO
+    return datetime.fromtimestamp(path.stat().st_mtime), DATE_FROM_FILE
+
+
+def read_taken_at(path: Path) -> tuple[datetime, bool]:
+    """(capture date, whether it came specifically from EXIF).
+
+    Thin wrapper kept for callers that only care about the EXIF question;
+    read_capture_date is the fuller version and is what the app uses.
+    """
+    stamp, source = read_capture_date(path)
+    return stamp, source == DATE_FROM_EXIF
+
+
+# --------------------------------------------------------------------------
+# 1b. Capture dates for video (QuickTime / MP4 containers)
+# --------------------------------------------------------------------------
+#
+# .mp4 and .mov files carry no EXIF whatsoever — EXIF is a stills standard.
+# The capture date lives in the container itself, which is a tree of "atoms"
+# (the spec's word for a labelled box of bytes). Every atom starts with the
+# same 8-byte header:
+#
+#     [4 bytes: total size, big-endian][4 bytes: type, e.g. b"moov"]
+#
+# and the two dates we want are nested inside the movie header:
+#
+#     moov -> mvhd            seconds since 1904, always UTC
+#     moov -> udta -> ©day    an ISO-8601 string that includes the UTC offset
+#
+# Reading that is just int.from_bytes and seeks, so it needs no new
+# dependency: no ffmpeg, no exiftool, nothing for the user to install.
+
+_ATOM_HEADER = 8
+# QuickTime counts seconds from 1904-01-01 UTC, not the Unix 1970 epoch.
+# Getting this wrong shifts every video by 66 years.
+_QT_EPOCH = datetime(1904, 1, 1, tzinfo=timezone.utc)
+# Muxers that do not know the date write 0, and a single corrupt byte can
+# produce the year 12000. Anything outside this window is not a real date.
+_EARLIEST_PLAUSIBLE = datetime(1990, 1, 1)
+# The "©day" user-data atom. That first byte really is 0xA9 (a copyright
+# sign), which is how QuickTime marks its own metadata keys.
+_DAY_ATOM = b"\xa9day"
+
+
+def _is_plausible(stamp: datetime) -> bool:
+    """Reject the failure modes that produce a valid-looking but wrong date."""
+    return _EARLIEST_PLAUSIBLE <= stamp <= datetime.now() + timedelta(days=1)
+
+
+def _iter_atoms(fh, start: int, end: int):
+    """Yield (type, body_start, atom_end) for each atom between start and end.
+
+    It re-seeks from its own bookkeeping on every step, so a caller is free to
+    read around inside the atom it was just handed (which is how the nested
+    moov -> udta -> ©day walk below works).
+    """
+    pos = start
+    while pos + _ATOM_HEADER <= end:
+        fh.seek(pos)
+        header = fh.read(_ATOM_HEADER)
+        if len(header) < _ATOM_HEADER:
+            return
+        size = int.from_bytes(header[:4], "big")
+        atom_type = header[4:8]
+        body = pos + _ATOM_HEADER
+        if size == 1:
+            # size == 1 means "the real, 64-bit size follows the type field".
+            raw = fh.read(8)
+            if len(raw) < 8:
+                return
+            size = int.from_bytes(raw, "big")
+            body = pos + _ATOM_HEADER + 8
+        elif size == 0:
+            # size == 0 means "this atom runs to the end of the file".
+            size = end - pos
+        atom_end = pos + size
+        # Corrupt or truncated: stop walking rather than guess. size >= 8 also
+        # guarantees pos advances every loop, so this can never spin.
+        if size < _ATOM_HEADER or atom_end > end or body > atom_end:
+            return
+        yield atom_type, body, atom_end
+        pos = atom_end
+
+
+def _quicktime_seconds_to_datetime(seconds: int) -> datetime | None:
+    """Convert a 1904-epoch UTC timestamp to naive local time, or None."""
+    if seconds <= 0:
+        return None
+    try:
+        stamp = _QT_EPOCH + timedelta(seconds=seconds)
+        # mvhd carries no location, so the best we can do is the timezone this
+        # machine is in. Dropping tzinfo afterwards keeps videos comparable
+        # with EXIF dates, which are always naive camera wall-clock.
+        local = stamp.astimezone().replace(tzinfo=None)
+    except (OverflowError, OSError, ValueError):
+        return None
+    return local if _is_plausible(local) else None
+
+
+def _parse_offset_date(text: str) -> datetime | None:
+    """Parse the ISO-8601 string a ©day atom holds.
+
+    Seen in the wild as 2026-06-12T14:22:33+0100, ...+01:00 and ...Z.
+    Python 3.10's fromisoformat rejects the first two, so normalise first.
+    """
+    text = text.strip().strip("\x00").strip()
+    if not text:
+        return None
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    # "+0100" -> "+01:00". Offsets already punctuated are left alone.
+    text = re.sub(r"([+-]\d{2})(\d{2})$", r"\1:\2", text)
+    try:
+        stamp = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    # An offset here is the best information any video format gives us: the
+    # string is already the wall-clock time where the camera stood, so we keep
+    # those digits and drop the offset rather than shifting them into our own
+    # timezone. A photo shot at 14:22 should be named 14-22 wherever it lands.
+    stamp = stamp.replace(tzinfo=None)
+    return stamp if _is_plausible(stamp) else None
+
+
+def _read_mvhd_date(fh, start: int, end: int) -> datetime | None:
+    """moov/mvhd: [1 version byte][3 flag bytes][creation time]."""
+    fh.seek(start)
+    head = fh.read(4)
+    if len(head) < 4:
+        return None
+    width = 8 if head[0] == 1 else 4   # version 1 widened the timestamps to 64 bits
+    if start + 4 + width > end:
+        return None
+    raw = fh.read(width)
+    if len(raw) < width:
+        return None
+    return _quicktime_seconds_to_datetime(int.from_bytes(raw, "big"))
+
+
+def _read_udta_date(fh, start: int, end: int) -> datetime | None:
+    """moov/udta/©day, whose payload is
+    [2 bytes text length][2 bytes language code][the date string]."""
+    for atom_type, body, atom_end in _iter_atoms(fh, start, end):
+        if atom_type != _DAY_ATOM:
+            continue
+        fh.seek(body)
+        raw = fh.read(min(atom_end - body, 128))
+        if len(raw) <= 4:
+            continue
+        stamp = _parse_offset_date(raw[4:].decode("utf-8", "ignore"))
+        if stamp is not None:
+            return stamp
+    return None
+
+
+def read_video_created_at(path: Path) -> datetime | None:
+    """Capture date from a .mp4/.mov container, or None if it carries none.
+
+    Prefers ©day over mvhd: ©day states the camera's UTC offset, so its
+    wall-clock time is exact, while mvhd is bare UTC and can only be shifted
+    into whichever timezone this computer happens to be set to.
+    """
+    try:
+        with path.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            end = fh.tell()
+            # moov sits at the start of some files and the very end of others
+            # (cameras usually write it last). Seeking past each top-level
+            # atom finds it either way without reading the video data.
+            for atom_type, body, atom_end in _iter_atoms(fh, 0, end):
+                if atom_type != b"moov":
+                    continue
+                from_mvhd = from_udta = None
+                for child, c_body, c_end in _iter_atoms(fh, body, atom_end):
+                    if child == b"mvhd":
+                        from_mvhd = _read_mvhd_date(fh, c_body, c_end)
+                    elif child == b"udta":
+                        from_udta = _read_udta_date(fh, c_body, c_end)
+                return from_udta or from_mvhd
+    except (OSError, ValueError):
+        # Unreadable, unplugged, or not really a video: fall back to the file
+        # date rather than refusing to list the file at all.
+        return None
+    return None
 
 
 def natural_key(text: str) -> list:
@@ -171,14 +382,15 @@ def scan_paths(paths) -> tuple[list[PhotoFile], int]:
             continue
         seen.add(resolved)
         try:
-            taken_at, from_exif = read_taken_at(p)
+            taken_at, date_source = read_capture_date(p)
             size = p.stat().st_size
         except OSError:
             # Deleted, unplugged or unreadable between listing and reading it.
             skipped += 1
             continue
-        files.append(PhotoFile(path=p, taken_at=taken_at,
-                               size=size, from_exif=from_exif))
+        files.append(PhotoFile(path=p, taken_at=taken_at, size=size,
+                               from_exif=date_source == DATE_FROM_EXIF,
+                               date_source=date_source))
     return files, skipped
 
 

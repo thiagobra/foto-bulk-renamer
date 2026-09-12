@@ -125,11 +125,30 @@ Sources:
 
 ## Sorting and dates
 
-Numbering follows **the date the photo was taken**, read from EXIF, so a batch
-numbers chronologically even if you added the files out of order. Videos and
-screenshots have no EXIF, so their file date is used instead; the preview pane
-tells you which was used. Ties fall back to Explorer-style name order
-(`IMG_9` before `IMG_10`).
+Numbering follows **the date the file was captured**, so a batch numbers
+chronologically even if you added the files out of order — and photos and
+videos are ranked on **one shared timeline**, not sorted into separate piles.
+A clip shot between two stills gets the number between them.
+
+That date is read from inside the file, in this order of trust:
+
+| Source | Used for | Why it is trusted first |
+|---|---|---|
+| **EXIF** `DateTimeOriginal` | `.jpg .jpeg .png .webp .heic .heif .dng` | Written by the camera at the moment the shutter fired. |
+| **MP4/MOV container** — `©day`, else `mvhd` | `.mp4 .mov .3gp` | Video has no EXIF; the date lives in the container header instead. `©day` is preferred because it also records the camera's UTC offset, so the wall-clock time is exact. |
+| **File modified date** | anything with neither (screenshots, exports, clips a muxer stamped with nothing) | Last resort only: copying, importing or cloud-syncing a file rewrites it, which is how a holiday ends up ordered by download time. |
+
+The preview pane names the source for the selected file, so a row that fell
+back to the file date is visible rather than silently misplaced. Ties fall back
+to Explorer-style name order (`IMG_9` before `IMG_10`).
+
+Reading video dates needs no extra program — no ffmpeg, no exiftool. The
+container is parsed directly with the Python standard library.
+
+One honest limit: EXIF dates and `mvhd` dates carry no timezone. If you mix
+two cameras whose clocks were set to different zones, they will interleave by
+those clock readings, not by the true instant. `©day` (written by iPhones and
+most recent cameras) does not have this problem.
 
 Supported: `.jpg .jpeg .png .webp .heic .heif .dng` and `.mp4 .mov .3gp`.
 Anything else you drop in is ignored and counted in the status line.
@@ -216,6 +235,6 @@ was cleared.
 
 | | Where | Status |
 |---|---|---|
-| Logic — 76 unit tests | Windows **and** Linux, Python 3.10 and 3.12 | ✅ green on every push (CI). This includes the rules that only behave like Windows *on* Windows: the 260-character path cap, reserved names (`CON`, `NUL`), and case-only renames such as `IMG_0001.JPG` → `img_0001.jpg`. |
+| Logic — 83 unit tests | Windows **and** Linux, Python 3.10 and 3.12 | ✅ green on every push (CI). This includes the rules that only behave like Windows *on* Windows: the 260-character path cap, reserved names (`CON`, `NUL`), and case-only renames such as `IMG_0001.JPG` → `img_0001.jpg`. |
 | The real window | Linux, headless | ✅ green on every push (CI), plus a 57-check manual sweep via `tools/gui_drive_full.py` |
 | Windows **desktop** behaviour | a real Windows PC | ⚠️ **Not verified.** DPI awareness, the dark title bar, double-clicking `run.bat`, and the PyInstaller `.exe` cannot be exercised by a CI runner with no desktop session. They are reviewed against the Windows API docs and asserted where a file can be asserted (`test_packaging.py` checks the batch files' CRLF endings, block syntax and build flags), but nobody has yet double-clicked `run.bat` on Windows. That is the one remaining gap. |
