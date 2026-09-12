@@ -197,6 +197,7 @@ class FotoRenamer:
         self.dir_index = renamer.DirectoryIndex()
 
         self._preview_job: str | None = None
+        self._tick_job: str | None = None        # the 120 ms background tick
         self._thumb_token = 0
         self._thumb_queue: queue.Queue = queue.Queue()
         self._thumb_image: ImageTk.PhotoImage | None = None
@@ -222,7 +223,11 @@ class FotoRenamer:
         # Coming back from Explorer is the likeliest moment for the folder to
         # have changed behind us, so drop the cached listing and re-plan.
         self.root.bind("<FocusIn>", self._on_focus_in, add="+")
-        self.root.after(120, self._poll_thumbnails)
+        # Cancel the pending timers when the window goes, or Tk fires them
+        # into a dead interpreter. tools/ destroys the root directly, so this
+        # cannot live in _on_close.
+        self.root.bind("<Destroy>", self._on_destroy, add="+")
+        self._schedule_tick()
         self._on_preset_change()
         # _on_preset_change resets the clean-up switches to the preset's own
         # defaults, so the switches the user saved have to be put back AFTER
@@ -359,6 +364,18 @@ class FotoRenamer:
     def _on_close(self) -> None:
         self._save_settings()
         self.root.destroy()
+
+    def _on_destroy(self, event) -> None:
+        """Tk fires <Destroy> for every child widget too; only the window counts."""
+        if event.widget is not self.root:
+            return
+        self._cancel_tick()
+        if self._preview_job is not None:
+            try:
+                self.root.after_cancel(self._preview_job)
+            except tk.TclError:
+                pass
+            self._preview_job = None
 
     # -- styling ----------------------------------------------------------
 
@@ -1122,15 +1139,34 @@ class FotoRenamer:
         except Exception:
             self._thumb_queue.put((token, None))
 
+    def _schedule_tick(self) -> None:
+        self._tick_job = self.root.after(120, self._on_tick)
+
+    def _on_tick(self) -> None:
+        self._tick_job = None          # this one has fired: nothing left to cancel
+        self._poll_thumbnails()
+
+    def _cancel_tick(self) -> None:
+        if self._tick_job is None:
+            return
+        try:
+            self.root.after_cancel(self._tick_job)
+        except tk.TclError:
+            pass                       # already fired, or the window has gone
+        self._tick_job = None
+
     def _poll_thumbnails(self) -> None:
         """The app's single 120 ms tick, draining both background workers.
 
         Kept under its original name because tools/gui_drive_full.py pumps it
-        by hand in several places.
+        by hand in several places. Those hand-pumped calls replace the pending
+        tick rather than adding to it — otherwise every manual call would
+        leave another chain of after() callbacks running behind it.
         """
+        self._cancel_tick()
         self._drain_thumbnail_queue()
         self._drain_exif_queue()
-        self.root.after(120, self._poll_thumbnails)
+        self._schedule_tick()
 
     def _drain_thumbnail_queue(self) -> None:
         try:

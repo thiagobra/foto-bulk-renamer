@@ -1,7 +1,6 @@
 """Build a realistic photo tree to drive the GUI against."""
 import shutil, sys
 from pathlib import Path
-from datetime import datetime
 from PIL import Image
 
 ROOT = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("fixtures")

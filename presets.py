@@ -49,7 +49,7 @@ PRESETS: list[Preset] = [
         key="date_event_n",
         label="★  Date · Event · Number",
         pattern="{date}_{event}_{n}",
-        example=f"2026-06-12_lakeside-wedding_014.jpg",
+        example="2026-06-12_lakeside-wedding_014.jpg",
         cleanup=_STANDARD,
         note="The recommended default: sorts chronologically, says what it is.",
     ),

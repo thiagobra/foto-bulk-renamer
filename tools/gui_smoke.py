@@ -15,7 +15,6 @@ import sys
 import tempfile
 import time
 import traceback
-from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
