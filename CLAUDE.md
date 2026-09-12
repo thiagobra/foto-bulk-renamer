@@ -55,11 +55,15 @@ every new name before anything touches disk and a one-click undo.
 
 ## Current work
 
-`ARCHITECTURE_PLAN.md` is **done** — compute-once fields, injected directory index,
-threaded EXIF backfill, and the tests and bench that keep them honest. The document
-carries the measured before/after numbers at the top.
+`ARCHITECTURE_PLAN.md` is **planned, not started** — the `{place}` token that names a
+photo after where you were, plus the two capture-date fixes it depends on (EXIF
+`CreateDate` was being skipped in favour of the edit time; videos had no date read at
+all). Read it before touching the metadata layer.
 
-Two things it leaves behind that are worth knowing before editing the core:
+The previous round of work in that file — compute-once fields, the injected directory
+index, the threaded EXIF backfill — is **done**, and its measured before/after numbers
+(an 80x preview speed-up) are in git at `git show 2625218:ARCHITECTURE_PLAN.md`. Two
+things it left behind are worth knowing before editing the core:
 
 - **Anything that changes a `PhotoFile`'s path or date must go through `relocate()` or
   `set_taken_at()`**, never a bare assignment — those are what refresh the cached
