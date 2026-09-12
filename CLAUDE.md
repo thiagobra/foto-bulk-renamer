@@ -4,14 +4,28 @@ Project guidance for Claude Code working in this repository.
 
 ## Workflow
 
-**Always commit and push what you do.** This is a solo-dev repo — no pull requests, no
-review gate. Finish a piece of work, commit it with a clear message, push it to the working
-branch. Do not leave changes sitting uncommitted in the working tree and do not wait to be
-asked.
+**ALWAYS commit. ALWAYS merge to `main`. ALWAYS push.** This is a solo-dev repo — no pull
+requests, no review gate, no waiting. Work is not finished until it is **on `main` on
+GitHub**. A file sitting on a feature branch is invisible to me and does not count as
+delivered.
 
-- Push with `git push -u origin <branch>`.
-- Commit messages: say what changed and why, in plain language.
-- Only open a PR if explicitly asked for one.
+Every piece of work ends with this sequence, every time, without being asked:
+
+```bash
+git add -A
+git commit -m "<what changed and why>"
+git push -u origin <working-branch>     # keep the branch current
+git checkout main
+git pull origin main
+git merge <working-branch>              # no PR, just merge it
+git push origin main                    # THIS is the step that makes it visible
+git checkout <working-branch>           # carry on where you were
+```
+
+- **Never end a turn with uncommitted changes or with work stranded on a branch.**
+- If the merge conflicts, resolve it and finish the merge — do not stop and leave `main` behind.
+- Say explicitly which branch the work landed on, so there is never any doubt.
+- Only open a PR if I explicitly ask for one.
 
 ## What this project is
 
