@@ -1184,6 +1184,133 @@ class TestScanResilience(unittest.TestCase):
             self.assertEqual(skipped, 1)
 
 
+class TestScanSyscalls(unittest.TestCase):
+    """What a drop costs the filesystem.
+
+    The scan is the one thing the user actually waits on. It used to ask for
+    the same directory three times per file — iterdir's listing, is_file, and
+    a stat for the size — on top of read_taken_at's own stat. One scandir pass
+    answers the first three at once.
+
+    DirEntry.stat() is free on Windows (the listing already carries the size)
+    and one call on Unix, so it is counted separately rather than folded in.
+    """
+
+    def _counted_scan(self, directory, **kwargs):
+        calls = {"scandir": 0, "entry_stat": 0, "entry_is_file": 0,
+                 "path_stat": 0, "path_is_file": 0, "iterdir": 0}
+        real = {"scandir": os.scandir, "stat": Path.stat,
+                "is_file": Path.is_file, "iterdir": Path.iterdir}
+
+        class CountingEntry:
+            """A DirEntry that says when it is asked for something."""
+
+            def __init__(self, entry):
+                self._entry = entry
+                self.path = entry.path
+                self.name = entry.name
+
+            def is_file(self, **kw):
+                calls["entry_is_file"] += 1
+                return self._entry.is_file(**kw)
+
+            def stat(self, **kw):
+                calls["entry_stat"] += 1
+                return self._entry.stat(**kw)
+
+        class CountingScandir:
+            def __init__(self, *args, **kw):
+                calls["scandir"] += 1
+                self._entries = real["scandir"](*args, **kw)
+
+            def __enter__(self):
+                return (CountingEntry(entry) for entry in self._entries)
+
+            def __exit__(self, *exc):
+                return self._entries.__exit__(*exc)
+
+        def counting_stat(self, *a, **kw):
+            calls["path_stat"] += 1
+            return real["stat"](self, *a, **kw)
+
+        def counting_is_file(self, *a, **kw):
+            calls["path_is_file"] += 1
+            return real["is_file"](self, *a, **kw)
+
+        def counting_iterdir(self, *a, **kw):
+            calls["iterdir"] += 1
+            return real["iterdir"](self, *a, **kw)
+
+        os.scandir = CountingScandir
+        Path.stat, Path.is_file, Path.iterdir = (counting_stat, counting_is_file,
+                                                 counting_iterdir)
+        try:
+            files, skipped = renamer.scan_paths([directory], **kwargs)
+        finally:
+            os.scandir, Path.stat = real["scandir"], real["stat"]
+            Path.is_file, Path.iterdir = real["is_file"], real["iterdir"]
+        return files, skipped, calls
+
+    def test_a_folder_is_listed_once_and_statted_once_per_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            for i in range(12):
+                write_jpeg(directory / f"IMG_{i:04d}.jpg")
+            (directory / "notes.txt").write_text("not a photo")
+
+            files, skipped, calls = self._counted_scan(directory, read_exif=False)
+
+        self.assertEqual(len(files), 12)
+        self.assertEqual(skipped, 1)
+        self.assertEqual(calls["scandir"], 1, "the folder was listed more than once")
+        self.assertEqual(calls["iterdir"], 0, "iterdir is back on the scan path")
+        # Two stats per supported file, and one for the dropped folder itself:
+        # read_taken_at's modified-time fallback, and the one pathlib spends
+        # inside PhotoFile's own resolve(). The size no longer costs a third.
+        # The .txt never reaches either, being an unsupported extension.
+        self.assertLessEqual(calls["path_stat"], 2 * len(files) + 1,
+                             "the scan is statting files a second time")
+        self.assertLessEqual(calls["entry_stat"], 13,
+                             "the listing is being re-asked for sizes")
+        self.assertEqual(calls["path_is_file"], 0,
+                         "is_file per entry is what scandir was meant to replace")
+
+    def test_the_size_comes_from_the_listing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            write_jpeg(directory / "IMG_0001.jpg")
+            expected = (directory / "IMG_0001.jpg").stat().st_size
+            files, _ = renamer.scan_paths([directory], read_exif=False)
+        self.assertEqual(files[0].size, expected)
+
+    def test_a_file_named_directly_still_gets_its_size(self):
+        """A file the user picked never went through a listing, so it has to
+        be statted for its size like before."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "IMG_0001.jpg"
+            write_jpeg(path)
+            expected = path.stat().st_size
+            files, _ = renamer.scan_paths([path], read_exif=False)
+            self.assertEqual(files[0].size, expected)
+
+    def test_an_unreadable_folder_is_counted_as_skipped_not_a_crash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            real_scandir = os.scandir
+
+            def refusing_scandir(target, *a, **kw):
+                if Path(target) == directory:
+                    raise PermissionError(13, "Permission denied")
+                return real_scandir(target, *a, **kw)
+
+            os.scandir = refusing_scandir
+            try:
+                files, skipped = renamer.scan_paths([directory])
+            finally:
+                os.scandir = real_scandir
+        self.assertEqual((files, skipped), ([], 1))
+
+
 class TestDirectoryIndex(unittest.TestCase):
     """The index is a cache of a folder listing. These are the ways a cache
     goes wrong: it misses a change we made, it blocks a name we just freed,

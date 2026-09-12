@@ -93,6 +93,104 @@ def old_plan_renames(files, settings):
     return plans
 
 
+def old_scan_paths(paths, *, read_exif=True):
+    """The pre-P5 scan: iterdir + is_file, then a stat per file for the size.
+
+    Kept verbatim so the syscall row below is measured rather than quoted.
+    """
+    candidates = []
+    skipped = 0
+    for raw in paths:
+        p = Path(raw)
+        if p.is_dir():
+            candidates.extend(sorted(c for c in p.iterdir() if c.is_file()))
+        elif p.is_file():
+            candidates.append(p)
+        else:
+            skipped += 1
+
+    files, seen = [], set()
+    for p in candidates:
+        if p.suffix.lower() not in renamer.SUPPORTED_EXTS:
+            skipped += 1
+            continue
+        try:
+            taken_at, from_exif = (renamer.read_taken_at(p) if read_exif
+                                   else renamer.read_taken_at(p, use_exif=False))
+            size = p.stat().st_size
+        except OSError:
+            skipped += 1
+            continue
+        photo = renamer.PhotoFile(path=p, taken_at=taken_at, size=size,
+                                  from_exif=from_exif)
+        if photo.resolved in seen:
+            continue
+        seen.add(photo.resolved)
+        files.append(photo)
+    return files, skipped
+
+
+def count_fs_calls(work):
+    """Run `work` with every filesystem question the scan can ask counted.
+
+    DirEntry.stat() is counted too, by handing scandir's entries back wrapped:
+    it is free on Windows, where the listing already carries the size, and one
+    call on Unix, so leaving it out would flatter the result on Linux.
+    """
+    # listing  os.scandir / Path.iterdir — one per folder
+    # stat     every stat that really happens, Path.is_file's own included
+    # entry    DirEntry questions: free on Windows, at most one call on Unix
+    calls = {"listing": 0, "stat": 0, "entry": 0}
+    real_scandir, real_stat = os.scandir, Path.stat
+    real_is_file, real_iterdir = Path.is_file, Path.iterdir
+
+    class CountingEntry:
+        def __init__(self, entry):
+            self._entry, self.path, self.name = entry, entry.path, entry.name
+
+        def is_file(self, **kw):
+            calls["entry"] += 1
+            return self._entry.is_file(**kw)
+
+        def stat(self, **kw):
+            calls["entry"] += 1
+            return self._entry.stat(**kw)
+
+    class CountingScandir:
+        def __init__(self, *a, **kw):
+            calls["listing"] += 1
+            self._entries = real_scandir(*a, **kw)
+
+        def __enter__(self):
+            return (CountingEntry(entry) for entry in self._entries)
+
+        def __exit__(self, *exc):
+            return self._entries.__exit__(*exc)
+
+    def counting_stat(self, *a, **kw):
+        calls["stat"] += 1
+        return real_stat(self, *a, **kw)
+
+    def counting_is_file(self, *a, **kw):
+        # Not counted itself: pathlib answers it with a stat, and that stat
+        # goes through the counter below. Counting both would double it.
+        return real_is_file(self, *a, **kw)
+
+    def counting_iterdir(self, *a, **kw):
+        calls["listing"] += 1
+        return real_iterdir(self, *a, **kw)
+
+    os.scandir = CountingScandir
+    Path.stat, Path.is_file, Path.iterdir = (counting_stat, counting_is_file,
+                                             counting_iterdir)
+    try:
+        work()
+    finally:
+        os.scandir, Path.stat = real_scandir, real_stat
+        Path.is_file, Path.iterdir = real_is_file, real_iterdir
+    return calls
+
+
 # --------------------------------------------------------------------------
 # Timing
 # --------------------------------------------------------------------------
@@ -166,6 +264,16 @@ def report(photos: Path, args) -> int:
     settings = RenameSettings(event="lakeside wedding")
 
     # --- the drop --------------------------------------------------------
+    old_calls = count_fs_calls(
+        lambda: old_scan_paths([photos], read_exif=False))
+    new_calls = count_fs_calls(
+        lambda: renamer.scan_paths([photos], read_exif=False))
+    # Best of three for these two: they are the same work, and a single run
+    # of each would mostly measure which one warmed the page cache.
+    _, old_scan = time_it("", lambda: old_scan_paths([photos], read_exif=False))
+    _, new_scan = time_it("", lambda: renamer.scan_paths([photos],
+                                                         read_exif=False))
+
     _, slow_scan = time_it("", lambda: renamer.scan_paths([photos]), repeats=1)
     _, fast_scan = time_it("", lambda: renamer.scan_paths([photos], read_exif=False),
                            repeats=1)
@@ -216,7 +324,31 @@ def report(photos: Path, args) -> int:
     row("sort_files()  (natural_key per row)", old_sort, new_sort)
     rule()
     row(f"drop {len(files)} photos  (UI thread)", slow_scan, fast_scan)
+    row("  of which: the listing (iterdir vs scandir)", old_scan, new_scan)
     rule()
+    print()
+    print(f"{'The drop, in filesystem calls per file':<44}{'before':>7}{'after':>7}{'':>8}")
+    print(f"{'':<44}{'calls':>7}{'calls':>7}{'':>8}")
+    rule()
+
+    def per_file(calls, key):
+        return calls[key] / max(1, len(files))
+
+    row("stat calls", per_file(old_calls, "stat"), per_file(new_calls, "stat"))
+    row("directory listings", per_file(old_calls, "listing"),
+        per_file(new_calls, "listing"))
+    row("DirEntry questions  (free on Windows)",
+        per_file(old_calls, "entry"), per_file(new_calls, "entry"))
+    rule()
+    print()
+    print("On a fast SSD the two scans time the same; the saving is in the")
+    print("calls, which is what an SD card over USB charges for.")
+    print()
+    print("Two of the four stats per file are gone: is_file's and the one for")
+    print("the size, both answered by the listing now. The two left are")
+    print("read_taken_at's modified-time fallback and the one pathlib spends")
+    print("inside PhotoFile.resolve(). DirEntry questions are free on Windows,")
+    print("where the listing already carries the answer.")
     print()
     print("'before' re-creates the old approach in this script; 'after' calls")
     print("the current code. The listing row is the one that used to grow with")
