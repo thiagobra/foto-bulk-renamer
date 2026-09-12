@@ -35,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from PIL import Image                                        # noqa: E402
 
 import renamer                                               # noqa: E402
-from renamer import PhotoFile, RenameSettings                # noqa: E402
+from renamer import RenameSettings                           # noqa: E402
 
 
 # --------------------------------------------------------------------------

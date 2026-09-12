@@ -209,7 +209,6 @@ class FotoRenamer:
         self._exif_total = 0
         self._exif_read: set[Path] = set()       # resolved paths already tried
         self._scan_note = ""                     # status line to put back after
-        self._row_paths: list[Path] = []         # tree row order
 
         self.settings_file = renamer.app_data_dir() / "settings.json"
         self._restored_geometry = False
@@ -896,10 +895,6 @@ class FotoRenamer:
         self.checked = everything - self.checked
         self.refresh_preview()
 
-    def _path_for_row(self, iid: str) -> Path | None:
-        index = int(iid)
-        return self._row_paths[index] if 0 <= index < len(self._row_paths) else None
-
     def _photo_for_row(self, iid: str) -> renamer.PhotoFile | None:
         """The PhotoFile behind a tree row.
 
@@ -941,7 +936,6 @@ class FotoRenamer:
         selected = [int(iid) for iid in self.tree.selection()]
 
         self.tree.delete(*self.tree.get_children())
-        self._row_paths = [f.path for f in self.files]
         for index, photo in enumerate(self.files):
             self.tree.insert("", "end", iid=str(index),
                              values=("", photo.name, "", ""))

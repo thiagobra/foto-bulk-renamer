@@ -166,10 +166,11 @@ thumbnailed — decoding raw needs a much heavier dependency than this app wants
 | `app.py` | The window — layout, theme, drag & drop, live preview. |
 | `renamer.py` | All the naming rules. No GUI code, so it can be tested on its own. |
 | `presets.py` | The preset table as plain data — add your own in two lines. |
-| `test_renamer.py` | 66 tests for the naming and disk rules. No window needed. |
+| `test_renamer.py` | 86 tests for the naming and disk rules. No window needed. |
 | `test_packaging.py` | 10 tests for the Windows-only files (CRLF, batch syntax, build flags). |
 | `tools/gui_smoke.py` | Opens the real window and drives it. What CI runs. |
 | `tools/gui_drive_full.py` | The long manual GUI sweep (57 checks) and the screenshot generator. |
+| `tools/bench.py` | Times the live preview, old approach against current. Not run by CI. |
 | `make_icon.py` | Regenerates `assets/icon.ico`. |
 | `run.bat` / `build_exe.bat` | Run from source / build the standalone exe. |
 | `screenshots/` | Pictures of the app running, with an index explaining each one. |
@@ -178,7 +179,7 @@ thumbnailed — decoding raw needs a much heavier dependency than this app wants
 ### Running the tests
 
 ```
-python -m unittest discover -v -p "test_*.py"     # 76 tests, no display needed
+python -m unittest discover -v -p "test_*.py"     # 96 tests, no display needed
 xvfb-run -a python tools/gui_smoke.py             # drives the real window (Linux)
 python tools\gui_smoke.py                         # the same, on Windows
 ```

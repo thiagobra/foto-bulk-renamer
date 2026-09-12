@@ -37,14 +37,15 @@ every new name before anything touches disk and a one-click undo.
 | `renamer.py` | **Pure core.** Scanning, EXIF dates, pattern expansion, collision planning, the two-phase rename, the undo log. Imports no `tkinter` — keep it that way. |
 | `app.py` | The Tk window. A shell over `renamer.py`; it should hold no naming logic. |
 | `presets.py` | Naming presets as plain frozen dataclasses. Adding one is a two-line edit. |
-| `test_renamer.py` | 66 unit tests over the core, no window needed. |
+| `test_renamer.py` | 86 unit tests over the core, no window needed. |
 | `tools/gui_smoke.py`, `tools/gui_drive_full.py` | Headless GUI drives. CI runs the first one. |
+| `tools/bench.py` | Times the live preview against the old approach. Not a test; CI ignores it. |
 
 ## Rules that matter here
 
 - **The core stays GUI-free.** Anything that can be tested without a window belongs in
   `renamer.py`.
-- **Never break the existing tests to make a change fit.** All 66 must stay green; if a
+- **Never break the existing tests to make a change fit.** All 96 must stay green; if a
   change needs a test edited, say so explicitly rather than quietly rewriting it.
 - **The GUI's design and layout are settled.** Do not restyle, re-lay-out or "improve" the
   interface unless asked. Internal wiring changes are fine.
@@ -54,5 +55,15 @@ every new name before anything touches disk and a one-click undo.
 
 ## Current work
 
-See `ARCHITECTURE_PLAN.md` for the agreed three-part core refactor (compute-once fields,
-injected directory index, threaded EXIF backfill) and its verification plan.
+`ARCHITECTURE_PLAN.md` is **done** — compute-once fields, injected directory index,
+threaded EXIF backfill, and the tests and bench that keep them honest. The document
+carries the measured before/after numbers at the top.
+
+Two things it leaves behind that are worth knowing before editing the core:
+
+- **Anything that changes a `PhotoFile`'s path or date must go through `relocate()` or
+  `set_taken_at()`**, never a bare assignment — those are what refresh the cached
+  `resolved`, `date_display` and `sort_key`.
+- **`plan_renames()` and `sort_files()` must make no syscalls** when handed a warm
+  `DirectoryIndex`. `TestPreviewTouchesNoDisk` enforces that; if it fails, something
+  has put the filesystem back on the per-keystroke path.

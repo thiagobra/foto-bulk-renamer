@@ -3,6 +3,39 @@
 Three changes to the core, drawn from how the highest-starred open-source renamers are
 built. The GUI's design, layout and behaviour are deliberately unchanged.
 
+## Status: implemented
+
+A1, A2, A3 and A4 are all in. The plan below is kept as written, as the record of the
+design and the reasoning; what follows is what the work actually measured.
+
+Measured with `python tools/bench.py --files 2000` (Linux container SSD, Python 3.11).
+The `before` column is not quoted from this document — `tools/bench.py` re-creates the
+old code paths and times them in the same run, so both columns are measurements:
+
+| Hot path, per keystroke | Predicted | Measured before | After |
+|---|---|---|---|
+| `plan_renames()` | ~130 ms → ~45 ms | 113.4 ms | 52.5 ms |
+| └ the directory listing | 79 ms → 0 | 77.6 ms | **0** |
+| ticked filter — `resolve()` per file | 26 ms → 0 | 30.9 ms | 0.1 ms |
+| date column — `strftime()` per row | 3 ms → 0 | 2.5 ms | **0** |
+| drop 2,000 photos (UI thread) | frozen → instant | 270.3 ms | 64.2 ms |
+
+And the claim the whole exercise was for — renaming **20** files in a **2,000**-file
+folder (`--ticked 20`): **36.9 ms → 0.5 ms** per keystroke, 80x. The preview is no
+longer O(folder).
+
+Two decisions taken during implementation, beyond what is written below:
+
+- **The `<FocusIn>` invalidation was included**, not left as an optional nicety.
+- **The backfill sweeps every file whose date has not been read yet**, not just the
+  ones just added. Starting a worker abandons the running one, so covering only the new
+  files would silently strand the first drop on file dates if a second folder arrived
+  while the first was still reading.
+
+Verification: 96 unit tests (86 + 10), 12 GUI smoke checks, 57 full-drive checks. The
+zero-syscall contract test and the vacating-name test were each confirmed to fail when
+the logic they guard is broken.
+
 ## Context
 
 The live preview is the feature this app is built around: every keystroke re-plans every
