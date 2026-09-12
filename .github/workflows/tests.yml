@@ -1,0 +1,65 @@
+# Runs the unit suite on every push and pull request.
+#
+# It runs on Windows as well as Linux on purpose: this is a Windows app, and
+# the path rules it depends on (MAX_PATH, the reserved CON/NUL names,
+# case-insensitive name collisions) only behave like Windows *on* Windows.
+name: tests
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: unit tests (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        python-version: ["3.10", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run the unit suite
+        # renamer.py and presets.py are pure logic: no window is ever opened,
+        # so this needs no display server on any of these runners.
+        run: python -m unittest discover -v -p "test_*.py"
+
+  gui-smoke:
+    name: GUI smoke test (headless Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Tk and dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk xvfb
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build the window and drive it under a virtual display
+        # Proves the real UI constructs, all three modes render a preview and
+        # a rename round-trips through undo - the things a logic-only suite
+        # cannot see.
+        run: xvfb-run -a python tools/gui_smoke.py

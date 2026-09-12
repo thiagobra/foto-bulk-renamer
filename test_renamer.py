@@ -520,5 +520,238 @@ class TestDiskOperations(unittest.TestCase):
         renamer.undo_last()
 
 
+class TestWindowsPathLimit(unittest.TestCase):
+    """Windows refuses any path of 260 characters or more.
+
+    A long Event name is the easy way for a user to blunder into that, so the
+    plan has to cut the name down *before* anything touches the disk. These
+    tests check the limit is respected and that a name is cut in a way that
+    still reads like a name.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_a_long_event_name_is_capped_not_attempted(self):
+        write_jpeg(self.dir / "IMG_0001.jpg", exif_date="2026:06:12 14:22:33")
+        files, _ = renamer.scan_paths([self.dir])
+        plans = renamer.plan_renames(files, RenameSettings(event="x" * 300))
+        self.assertLessEqual(len(str(plans[0].target)), renamer.MAX_PATH_USABLE)
+        self.assertTrue(plans[0].truncated)
+        self.assertFalse(plans[0].too_long)
+
+    def test_a_normal_name_is_left_alone(self):
+        write_jpeg(self.dir / "IMG_0001.jpg", exif_date="2026:06:12 14:22:33")
+        files, _ = renamer.scan_paths([self.dir])
+        plans = renamer.plan_renames(files, RenameSettings(event="beach day"))
+        self.assertFalse(plans[0].truncated)
+        self.assertEqual(plans[0].new_name, "2026-06-12_beach-day_001.jpg")
+
+    def test_a_capped_name_does_not_end_on_a_dangling_separator(self):
+        stem, cut = renamer.fit_stem_to_path(
+            "2026-06-12_" + "ab-" * 200, directory=self.dir, ext=".jpg")
+        self.assertTrue(cut)
+        self.assertFalse(stem.endswith(("-", "_", " ", ".")))
+
+    def test_capping_still_leaves_room_for_the_dedupe_suffix(self):
+        for index in range(3):
+            write_jpeg(self.dir / f"IMG_{index}.jpg", exif_date="2026:06:12 14:22:33")
+        files, _ = renamer.scan_paths([self.dir])
+        # date_time makes all three want the identical name, so two get " (n)".
+        plans = renamer.plan_renames(
+            files, RenameSettings(pattern="{date}_" + "y" * 300))
+        for plan in plans:
+            self.assertLessEqual(len(str(plan.target)), renamer.MAX_PATH_USABLE)
+        self.assertTrue(any(p.conflict for p in plans))
+
+    def test_a_folder_that_is_already_too_deep_is_refused_not_half_renamed(self):
+        write_jpeg(self.dir / "IMG_0001.jpg", exif_date="2026:06:12 14:22:33")
+        files, _ = renamer.scan_paths([self.dir])
+        plans = renamer.plan_renames(files, RenameSettings(event="beach"))
+        plans[0].too_long = True          # pretend the folder path is enormous
+        result = renamer.apply_renames(plans)
+        self.assertEqual(result.renamed, [])
+        self.assertIn("too long", result.errors[0][1])
+        self.assertTrue((self.dir / "IMG_0001.jpg").exists())
+
+    def test_the_temporary_name_never_breaks_the_limit_itself(self):
+        """Phase 1 parks each file under a temp name. That name must fit too,
+        or a rename could fail for a name the user never asked for."""
+        long_name = "z" * 240 + ".jpg"
+        path = self.dir / long_name
+        write_jpeg(path)
+        temp = renamer._temp_name(path, 0)
+        self.assertLessEqual(len(str(temp)), renamer.MAX_PATH_USABLE)
+
+    def test_a_temporary_name_never_lands_on_an_existing_file(self):
+        """On Linux rename() silently destroys the file it lands on, so a
+        left-over temp file from an earlier crash must be stepped over."""
+        path = self.dir / "IMG_0001.jpg"
+        write_jpeg(path)
+        squatter = self.dir / f"IMG_0001.jpg{renamer.TEMP_SUFFIX}0"
+        squatter.write_text("a survivor of an earlier crash")
+        temp = renamer._temp_name(path, 0)
+        self.assertNotEqual(temp, squatter)
+        self.assertFalse(temp.exists())
+        self.assertEqual(squatter.read_text(), "a survivor of an earlier crash")
+
+
+class TestCaseOnlyRename(unittest.TestCase):
+    """IMG_0001.JPG -> img_0001.jpg is the same file to Windows.
+
+    Renaming straight over itself would be refused there, which is exactly
+    why every move goes via a temporary name first. Worth pinning down: it is
+    the most common rename this app does (the lowercase switch is on by
+    default) and it is the one Linux would let us get away with.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+        for spent in renamer.history_dir().glob("*.json*"):
+            spent.unlink()
+
+    def test_lowercasing_a_name_is_not_treated_as_a_collision(self):
+        write_jpeg(self.dir / "IMG_0001.JPG", exif_date="2026:06:12 14:22:33")
+        files, _ = renamer.scan_paths([self.dir])
+        plans = renamer.plan_renames(
+            files, RenameSettings(mode=Mode.REPLACE, find="IMG", replace_with="img"))
+        self.assertEqual(plans[0].new_name, "img_0001.jpg")
+        self.assertFalse(plans[0].conflict, "the file collided with itself")
+
+    def test_a_case_only_rename_round_trips(self):
+        write_jpeg(self.dir / "IMG_0001.JPG", exif_date="2026:06:12 14:22:33")
+        files, _ = renamer.scan_paths([self.dir])
+        plans = renamer.plan_renames(
+            files, RenameSettings(mode=Mode.REPLACE, find="IMG", replace_with="img"))
+        result = renamer.apply_renames(plans)
+        self.assertEqual(len(result.renamed), 1)
+        self.assertEqual([p.name for p in self.dir.iterdir()], ["img_0001.jpg"])
+        renamer.undo_last()
+        self.assertEqual([p.name for p in self.dir.iterdir()], ["IMG_0001.JPG"])
+
+
+class TestUndoDurability(unittest.TestCase):
+    """The undo log is the user's only way back. Losing it is the worst bug
+    this program could have, so a failed undo must not consume it."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        for spent in renamer.history_dir().glob("*.json"):
+            spent.unlink()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+        for spent in renamer.history_dir().glob("*.json*"):
+            spent.unlink()
+
+    def _rename_one(self):
+        write_jpeg(self.dir / "IMG_0001.jpg", exif_date="2026:06:12 14:22:33")
+        files, _ = renamer.scan_paths([self.dir])
+        return renamer.apply_renames(
+            renamer.plan_renames(files, RenameSettings(event="beach")))
+
+    def test_a_blocked_undo_keeps_the_log_so_it_can_be_retried(self):
+        self._rename_one()
+        real_rename = Path.rename
+
+        def refuse(self, target):
+            raise PermissionError(13, "file is open in another program")
+
+        Path.rename = refuse
+        try:
+            result = renamer.undo_last()
+        finally:
+            Path.rename = real_rename
+
+        self.assertEqual(result.renamed, [])
+        self.assertTrue(result.errors)
+        self.assertIsNotNone(renamer.last_log())      # still there to retry
+
+        again = renamer.undo_last()                   # now that it is free
+        self.assertEqual(len(again.renamed), 1)
+        self.assertTrue((self.dir / "IMG_0001.jpg").exists())
+        self.assertIsNone(renamer.last_log())         # only now is it spent
+
+    def test_a_successful_undo_retires_the_log(self):
+        self._rename_one()
+        renamer.undo_last()
+        self.assertIsNone(renamer.last_log())
+
+    def test_an_undo_of_vanished_files_retires_the_log(self):
+        result = self._rename_one()
+        result.moved[0][1].unlink()                   # user deleted the photo
+        outcome = renamer.undo_last()
+        self.assertTrue(outcome.errors)
+        self.assertIsNone(renamer.last_log())
+
+    def test_a_corrupt_log_is_retired_rather_than_failing_forever(self):
+        self._rename_one()
+        renamer.last_log().write_text("{ this is not json", encoding="utf-8")
+        outcome = renamer.undo_last()
+        self.assertIn("unreadable", outcome.errors[0][1])
+        self.assertIsNone(renamer.last_log())
+
+
+class TestHeicSupport(unittest.TestCase):
+    """HEIC is advertised as supported, so the code must be honest about what
+    'supported' means with and without the pillow-heif plugin installed."""
+
+    def test_heic_is_accepted_for_renaming_either_way(self):
+        self.assertIn(".heic", renamer.SUPPORTED_EXTS)
+        self.assertIn(".heif", renamer.SUPPORTED_EXTS)
+
+    def test_thumbnails_are_only_promised_when_the_plugin_is_present(self):
+        promised = renamer.HEIC_EXTS <= renamer.THUMBNAILABLE_EXTS
+        self.assertEqual(promised, renamer.HEIC_SUPPORT)
+
+    def test_a_heic_capture_date_is_read_when_the_plugin_is_present(self):
+        if not renamer.HEIC_SUPPORT:
+            self.skipTest("pillow-heif is not installed")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "IMG_9999.heic"
+            image = Image.new("RGB", (32, 24), (10, 10, 10))
+            exif = image.getexif()
+            exif.get_ifd(0x8769)[36867] = "2026:06:12 14:22:33"
+            image.save(path, format="HEIF", exif=exif)
+            taken, from_exif = renamer.read_taken_at(path)
+            self.assertTrue(from_exif)
+            self.assertEqual(taken, datetime(2026, 6, 12, 14, 22, 33))
+
+
+class TestScanResilience(unittest.TestCase):
+
+    def test_a_file_that_vanishes_mid_scan_is_skipped_not_a_crash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            write_jpeg(directory / "a.jpg")
+            ghost = directory / "b.jpg"
+            write_jpeg(ghost)
+            # The folder listing succeeds, then the file disappears before we
+            # can read it - a card pulled out mid-scan looks exactly like this.
+            real_read = renamer.read_taken_at
+
+            def vanishing_read(path):
+                if path.name == "b.jpg":
+                    raise FileNotFoundError(2, "No such file or directory")
+                return real_read(path)
+
+            renamer.read_taken_at = vanishing_read
+            try:
+                files, skipped = renamer.scan_paths([directory])
+            finally:
+                renamer.read_taken_at = real_read
+            self.assertEqual([f.name for f in files], ["a.jpg"])
+            self.assertEqual(skipped, 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

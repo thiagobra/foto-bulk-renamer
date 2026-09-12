@@ -31,6 +31,17 @@ try:
 except ImportError:  # pragma: no cover - Pillow is a hard runtime dependency
     Image = None
 
+# Pillow on its own CANNOT open .heic/.heif (the format Apple devices shoot in).
+# pillow-heif is a plugin that teaches it how. It is optional: without it the
+# app still renames HEIC files, it just cannot read their capture date or draw
+# a thumbnail. HEIC_SUPPORT lets the UI say so honestly instead of pretending.
+try:
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+    HEIC_SUPPORT = True
+except Exception:  # not installed, or too old to register
+    HEIC_SUPPORT = False
+
 
 # --------------------------------------------------------------------------
 # What we accept
@@ -40,8 +51,12 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif", ".dng"}
 VIDEO_EXTS = {".mp4", ".mov", ".3gp"}
 SUPPORTED_EXTS = IMAGE_EXTS | VIDEO_EXTS
 
-# Extensions Pillow can usually show a thumbnail for without extra plugins.
+# Extensions Pillow can decode for a thumbnail. .heic/.heif only join the set
+# when pillow-heif is installed, which is exactly when Pillow can read them.
+HEIC_EXTS = {".heic", ".heif"}
 THUMBNAILABLE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+if HEIC_SUPPORT:
+    THUMBNAILABLE_EXTS |= HEIC_EXTS
 
 # Windows forbids these characters in a file name, and these device names.
 ILLEGAL_CHARS = '<>:"/\\|?*'
@@ -49,6 +64,18 @@ RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10))
                   *(f"LPT{i}" for i in range(1, 10))}
 
 TEMP_SUFFIX = ".fotoren-tmp-"
+
+# Windows refuses any path of 260 characters or more (the classic MAX_PATH),
+# counting the drive, every folder, the file name and a hidden terminating
+# byte. That leaves 259 usable characters. Long-path support exists on Windows
+# 10+ but is off by default and File Explorer still trips over it, so we stay
+# inside the classic limit rather than produce names the user cannot open.
+MAX_PATH = 260
+MAX_PATH_USABLE = MAX_PATH - 1
+# Most file systems also cap a single name at 255 characters.
+MAX_NAME = 255
+# Head-room kept free so the " (1)" de-duplication suffix always still fits.
+DEDUPE_ROOM = 6
 
 
 # --------------------------------------------------------------------------
@@ -143,9 +170,15 @@ def scan_paths(paths) -> tuple[list[PhotoFile], int]:
         if resolved in seen:
             continue
         seen.add(resolved)
-        taken_at, from_exif = read_taken_at(p)
+        try:
+            taken_at, from_exif = read_taken_at(p)
+            size = p.stat().st_size
+        except OSError:
+            # Deleted, unplugged or unreadable between listing and reading it.
+            skipped += 1
+            continue
         files.append(PhotoFile(path=p, taken_at=taken_at,
-                               size=p.stat().st_size, from_exif=from_exif))
+                               size=size, from_exif=from_exif))
     return files, skipped
 
 
@@ -229,6 +262,26 @@ def apply_cleanup(stem: str, opts: CleanupOptions) -> str:
         out = re.sub(r"_{2,}", "_", out)
         out = out.strip("-_")
     return out
+
+
+def fit_stem_to_path(stem: str, *, directory: Path, ext: str) -> tuple[str, bool]:
+    """Shorten `stem` until directory/stem+ext fits inside Windows' MAX_PATH.
+
+    Returns (stem, was_truncated). A name is only ever cut from the end, and
+    any separator left dangling ("holiday-") is trimmed, so the result still
+    reads like a name. If the *folder* alone is already too deep there is
+    nothing a shorter name can fix; we return the stem untouched and flag it,
+    and the rename is refused later rather than half-done.
+    """
+    budget = min(
+        MAX_PATH_USABLE - len(str(directory)) - 1 - len(ext) - DEDUPE_ROOM,
+        MAX_NAME - len(ext) - DEDUPE_ROOM,
+    )
+    if budget <= 0:
+        return stem, True
+    if len(stem) <= budget:
+        return stem, False
+    return (stem[:budget].rstrip("-_ .") or "unnamed"), True
 
 
 def sanitize_stem(stem: str) -> str:
@@ -367,6 +420,8 @@ class RenamePlan:
     photo: PhotoFile
     new_name: str
     conflict: bool = False   # had to be de-duplicated with " (1)"
+    truncated: bool = False  # had to be shortened to fit Windows' MAX_PATH
+    too_long: bool = False   # the folder alone is too deep - cannot be fixed
 
     @property
     def changed(self) -> bool:
@@ -414,8 +469,10 @@ def plan_renames(files: list[PhotoFile], settings: RenameSettings) -> list[Renam
         # file to Windows, and lowercase extensions are the universal
         # convention. The name itself is only lowercased if you ask for it.
         ext = photo.ext.lower()
-        candidate = stem + ext
         directory = photo.path.parent
+        stem, truncated = fit_stem_to_path(stem, directory=directory, ext=ext)
+        too_long = truncated and len(str(directory / (stem + ext))) > MAX_PATH_USABLE
+        candidate = stem + ext
 
         # Explorer-style de-duplication: name (1).jpg, name (2).jpg …
         conflict = False
@@ -425,7 +482,9 @@ def plan_renames(files: list[PhotoFile], settings: RenameSettings) -> list[Renam
             candidate = f"{stem} ({counter}){ext}"
             counter += 1
         taken[directory].add(candidate.lower())
-        plans.append(RenamePlan(photo=photo, new_name=candidate, conflict=conflict))
+        plans.append(RenamePlan(photo=photo, new_name=candidate, conflict=conflict,
+                                truncated=truncated and not too_long,
+                                too_long=too_long))
     return plans
 
 
@@ -462,6 +521,27 @@ def history_dir() -> Path:
     return directory
 
 
+def _temp_name(src: Path, index: int) -> Path:
+    """A free, unused name to park `src` under during phase 1.
+
+    Two things have to hold. The name must not already exist - on POSIX,
+    rename() would silently destroy whatever is sitting there. And the
+    resulting path must not push us past Windows' MAX_PATH: keeping the
+    original name makes a crashed batch easy to recover by hand, so we do
+    that when it fits and fall back to a short marker name when it does not.
+    """
+    directory = src.parent
+    for attempt in range(1000):
+        tag = f"{TEMP_SUFFIX}{index}" if attempt == 0 else f"{TEMP_SUFFIX}{index}-{attempt}"
+        long_form = src.with_name(f"{src.name}{tag}")
+        temp = (long_form if len(str(long_form)) <= MAX_PATH_USABLE
+                else directory / tag.lstrip("."))
+        if not temp.exists():
+            return temp
+    # 1000 collisions means something is very wrong; let rename() report it.
+    return src.with_name(f"{src.name}{TEMP_SUFFIX}{index}")
+
+
 def _two_phase_move(moves: list[tuple[Path, Path]]) -> RenameResult:
     """Rename via temporary names so a full reshuffle (or an A<->B swap) is safe.
 
@@ -476,7 +556,7 @@ def _two_phase_move(moves: list[tuple[Path, Path]]) -> RenameResult:
     blocked: set[Path] = set()   # names a skipped file is still sitting on
 
     for i, (src, dst) in enumerate(moves):
-        temp = src.with_name(f"{src.name}{TEMP_SUFFIX}{i}")
+        temp = _temp_name(src, i)
         try:
             src.rename(temp)
         except OSError as exc:
@@ -520,11 +600,28 @@ def _two_phase_move(moves: list[tuple[Path, Path]]) -> RenameResult:
 
 def apply_renames(plans: list[RenamePlan], *, write_log: bool = True) -> RenameResult:
     """Rename every plan whose name actually changes, then write an undo log."""
-    moves = [(p.photo.path, p.target) for p in plans if p.changed]
-    if not moves:
-        return RenameResult()
+    result = RenameResult()
+    doable = []
+    for plan in plans:
+        if not plan.changed:
+            continue
+        if plan.too_long:
+            # Even an empty name would not fit. Renaming would only half-work,
+            # so say why instead of letting the OS fail halfway through.
+            result.errors.append(
+                (plan.photo.name,
+                 f"the folder path is too long for Windows "
+                 f"({len(str(plan.photo.path.parent))} characters) — "
+                 f"move the photos closer to the drive root"))
+            continue
+        doable.append((plan.photo.path, plan.target))
+    if not doable:
+        return result
 
-    result = _two_phase_move(moves)
+    moved = _two_phase_move(doable)
+    result.renamed.extend(moved.renamed)
+    result.errors.extend(moved.errors)
+    result.moved.extend(moved.moved)
 
     if write_log and result.moved:
         pairs = [[str(old), str(new)] for old, new in result.moved]
@@ -543,15 +640,31 @@ def last_log() -> Path | None:
 
 
 def undo_last() -> RenameResult:
-    """Reverse the most recent batch. Files that have since moved are skipped."""
+    """Reverse the most recent batch. Files that have since moved are skipped.
+
+    An undo can be partly blocked - a photo may be open in another program
+    right now. When that happens the log is rewritten to hold only the moves
+    that still need reversing, so pressing Undo again after closing that
+    program finishes the job. The log is only retired once there is genuinely
+    nothing left in it to undo, which is what stops a failed undo from
+    throwing away the user's only way back.
+    """
     log_path = last_log()
     if log_path is None:
         return RenameResult(errors=[("", "Nothing to undo.")])
 
-    data = json.loads(log_path.read_text(encoding="utf-8"))
+    try:
+        data = json.loads(log_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        # A truncated or hand-edited log is useless; retire it rather than
+        # failing forever on the same file.
+        _retire_log(log_path)
+        return RenameResult(errors=[("", "The undo record is unreadable — skipped.")])
+
+    pairs = [p for p in data.get("pairs", []) if isinstance(p, list) and len(p) == 2]
     moves: list[tuple[Path, Path]] = []
     result = RenameResult()
-    for old_str, new_str in data.get("pairs", []):
+    for old_str, new_str in pairs:
         old, new = Path(old_str), Path(new_str)
         if new.exists():
             moves.append((new, old))
@@ -564,7 +677,35 @@ def undo_last() -> RenameResult:
         result.errors.extend(moved.errors)
         result.moved.extend(moved.moved)
 
-    # Mark the log as spent so the next undo steps further back in time.
-    log_path.rename(log_path.with_suffix(".json.undone"))
+    # A file that is still sitting under its NEW name was not put back.
+    remaining = [pair for pair in pairs if Path(pair[1]).exists()]
+    if remaining:
+        log_path.write_text(json.dumps(
+            {"timestamp": data.get("timestamp", ""), "pairs": remaining}, indent=2),
+            encoding="utf-8")
+    else:
+        _retire_log(log_path)
     result.log_path = log_path
     return result
+
+
+def _retire_log(log_path: Path) -> None:
+    """Mark a log as spent so the next Undo steps further back in time."""
+    try:
+        log_path.rename(log_path.with_suffix(".json.undone"))
+    except OSError:
+        pass
+    _prune_history()
+
+
+def _prune_history(keep: int = 200) -> None:
+    """Stop the history folder growing without limit over years of use."""
+    try:
+        spent = sorted(history_dir().glob("*.json.undone"))
+    except OSError:
+        return
+    for old in spent[:-keep]:
+        try:
+            old.unlink()
+        except OSError:
+            pass

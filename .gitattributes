@@ -1,0 +1,21 @@
+# Windows' cmd.exe is the one interpreter that still cares about line endings.
+# A .bat checked out with bare LF can mis-parse multi-line ( ... ) blocks and
+# labels, which is exactly what run.bat and build_exe.bat are built from — so
+# force CRLF for them no matter what the cloning machine's core.autocrlf says.
+*.bat        text eol=crlf
+*.cmd        text eol=crlf
+*.ps1        text eol=crlf
+
+# Everything else is LF, including on Windows: Python and Git both prefer it.
+*.py         text eol=lf
+*.md         text eol=lf
+*.txt        text eol=lf
+*.yml        text eol=lf
+*.json       text eol=lf
+.gitattributes text eol=lf
+.gitignore   text eol=lf
+
+# Never "fix" line endings inside binaries.
+*.png        binary
+*.ico        binary
+*.jpg        binary

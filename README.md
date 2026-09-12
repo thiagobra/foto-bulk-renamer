@@ -6,8 +6,12 @@ undo if you change your mind.
 
 ![Foto Renamer](screenshots/01-new-name-mode.png)
 
-*More views of the app — the other two modes, a custom pattern, the convention warning and
-the post-rename state — are in [`screenshots/`](screenshots/).*
+*More views of the app — the other two modes, a custom pattern, the convention
+warning, the post-rename state and the long-name guard — are in
+[`screenshots/`](screenshots/).*
+
+[![tests](https://github.com/thiagobra/foto-renamer-jua/actions/workflows/tests.yml/badge.svg)](https://github.com/thiagobra/foto-renamer-jua/actions/workflows/tests.yml)
+[![licence: MIT](https://img.shields.io/badge/licence-MIT-blue.svg)](LICENSE)
 
 ---
 
@@ -108,7 +112,16 @@ Sources:
 - If a new name is already taken by a file outside the batch, it gets
   ` (1)`, ` (2)` appended — Explorer's own behaviour. Those rows turn red in the preview.
 - Files that can't be renamed (open in another app, read-only) are reported;
-  the rest of the batch still completes.
+  the rest of the batch still completes, and nothing is renamed *onto* the
+  file that could not be moved.
+- **Names are capped to fit Windows' 260-character path limit.** A very long
+  Event name is shortened rather than attempted; those rows turn amber and a
+  warning appears under the controls. If the *folder* itself is already too
+  deep, the rename is refused with an explanation instead of half-applied.
+- **A blocked undo keeps its place in the queue.** If a photo is open in
+  another program when you press Undo, that file is reported and the undo
+  record is kept, so pressing Undo again once the program is closed finishes
+  the job. Only a fully-completed undo retires the record.
 
 ## Sorting and dates
 
@@ -120,6 +133,21 @@ tells you which was used. Ties fall back to Explorer-style name order
 
 Supported: `.jpg .jpeg .png .webp .heic .heif .dng` and `.mp4 .mov .3gp`.
 Anything else you drop in is ignored and counted in the status line.
+
+### A note on HEIC/HEIF (iPhone photos)
+
+Pillow cannot open a `.heic` on its own — it needs the **pillow-heif** plugin,
+which `requirements.txt` installs for you. With it, HEIC files get their real
+capture date and a thumbnail, exactly like a JPEG.
+
+Without it (if you installed the dependencies by hand and skipped it), HEIC
+files can still be renamed, but their date falls back to the file's modified
+date and no thumbnail is drawn. The app says so in the status line and in the
+preview pane rather than quietly using the wrong date. To fix it:
+`pip install pillow-heif`.
+
+`.dng` (raw) is renamed and dated from EXIF where present, but never
+thumbnailed — decoding raw needs a much heavier dependency than this app wants.
 
 ## Keyboard
 
@@ -138,19 +166,56 @@ Anything else you drop in is ignored and counted in the status line.
 | `app.py` | The window — layout, theme, drag & drop, live preview. |
 | `renamer.py` | All the naming rules. No GUI code, so it can be tested on its own. |
 | `presets.py` | The preset table as plain data — add your own in two lines. |
-| `test_renamer.py` | 49 tests. Run: `python -m unittest test_renamer -v` |
+| `test_renamer.py` | 66 tests for the naming and disk rules. No window needed. |
+| `test_packaging.py` | 10 tests for the Windows-only files (CRLF, batch syntax, build flags). |
+| `tools/gui_smoke.py` | Opens the real window and drives it. What CI runs. |
+| `tools/gui_drive_full.py` | The long manual GUI sweep (57 checks) and the screenshot generator. |
 | `make_icon.py` | Regenerates `assets/icon.ico`. |
 | `run.bat` / `build_exe.bat` | Run from source / build the standalone exe. |
 | `screenshots/` | Pictures of the app running, with an index explaining each one. |
+| `.github/workflows/tests.yml` | CI: the unit suite on Windows and Linux, plus a headless GUI run. |
+
+### Running the tests
+
+```
+python -m unittest discover -v -p "test_*.py"     # 76 tests, no display needed
+xvfb-run -a python tools/gui_smoke.py             # drives the real window (Linux)
+python tools\gui_smoke.py                         # the same, on Windows
+```
 
 ## Troubleshooting
 
 **Drag & drop does nothing** — `tkinterdnd2` didn't install. The app still works
 via **Add photos…**; to fix it, run `pip install tkinterdnd2` inside `.venv`.
 
-**The window looks blurry** — that's Windows scaling; the app asks for
-per-monitor DPI awareness, which needs a restart of the app after changing
-display scaling.
+**The window looks blurry** — that's Windows display scaling. The app asks for
+*system* DPI awareness, which Windows applies once at start-up, so restart the
+app after changing your scaling setting. On a two-monitor setup with different
+scaling factors, the window will look slightly soft on the second monitor;
+that is a limit of Tk, which cannot re-scale a window mid-flight.
+
+**HEIC photos show the wrong date** — `pillow-heif` is not installed. Run
+`pip install pillow-heif` inside `.venv`, or just delete the `.venv` folder and
+let `run.bat` rebuild it.
+
+**"The folder path is too long for Windows"** — Windows refuses any path of 260
+characters or more, and the folder your photos are in already uses most of that
+before a file name is added. Move the folder closer to the drive root
+(`C:\photos\` rather than a deep chain of folders) and try again.
 
 **Undo is greyed out** — there is no batch to undo yet, or the history folder
 was cleared.
+
+---
+
+## Licence
+
+[MIT](LICENSE) — do what you like with it.
+
+## Tested on
+
+| | |
+|---|---|
+| Logic (76 unit tests) | Windows and Linux, Python 3.10 and 3.12, on every push (CI) |
+| The real window | Linux, headless, on every push (CI); and by hand via `tools/gui_drive_full.py` |
+| Windows desktop behaviour | **Not yet verified on a real Windows machine.** The DPI, dark-title-bar, `run.bat` and PyInstaller paths are reviewed and unit-tested where testable, but no one has double-clicked `run.bat` on Windows yet. |

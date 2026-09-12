@@ -3,6 +3,10 @@
 pillow>=10.0          # reads EXIF capture dates, draws the preview thumbnail
 sv-ttk>=2.6           # the Windows 11 (Sun Valley / Fluent) dark theme
 tkinterdnd2>=0.4      # drag & drop from File Explorer (optional but nice)
+pillow-heif>=0.15     # lets Pillow open .heic/.heif — Apple's photo format.
+                      # Without it HEIC files can still be renamed, but their
+                      # capture date falls back to the file's modified date
+                      # and no thumbnail is drawn.
 
 # Only needed to build the .exe — build_exe.bat installs it for you:
 # pyinstaller>=6.0

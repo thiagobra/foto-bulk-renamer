@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import queue
+import re
 import sys
 import threading
 import tkinter as tk
@@ -70,17 +71,33 @@ INSERT_LABEL_BY_VALUE = {v: k for k, v in INSERT_LABELS.items()}
 # --------------------------------------------------------------------------
 
 def set_dpi_awareness() -> None:
-    """Crisp text on high-DPI screens. Must run before the window exists."""
+    """Crisp text on high-DPI screens. Must run before the window exists.
+
+    1 is PROCESS_SYSTEM_DPI_AWARE, not per-monitor. That is deliberate: Tk
+    cannot re-scale a window that is dragged to a monitor with a different
+    scaling factor, so claiming per-monitor awareness (2) would give us
+    correct-looking text on one screen and tiny text on the other. System
+    awareness lets Windows bitmap-stretch instead, which is slightly soft
+    but never wrong. shcore only exists on Windows 8.1 and newer, hence the
+    fallback to the older all-or-nothing call.
+    """
     if sys.platform != "win32":
         return
     import ctypes
     try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)   # per-monitor aware
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)   # SYSTEM_DPI_AWARE
     except Exception:
         try:
             ctypes.windll.user32.SetProcessDPIAware()
         except Exception:
             pass
+
+
+# DWMWA_USE_IMMERSIVE_DARK_MODE. Microsoft renumbered this attribute during
+# Windows 10: builds from 20H1 (18985) onward use 20, the earlier 1809-1909
+# builds used 19. Trying both costs nothing and covers every machine that has
+# a dark title bar at all.
+DARK_MODE_ATTRIBUTES = (20, 19)
 
 
 def dark_title_bar(window: tk.Misc) -> None:
@@ -91,8 +108,46 @@ def dark_title_bar(window: tk.Misc) -> None:
     try:
         window.update_idletasks()
         hwnd = ctypes.windll.user32.GetParent(window.winfo_id())
-        ctypes.windll.dwmapi.DwmSetWindowAttribute(
-            hwnd, 20, ctypes.byref(ctypes.c_int(1)), ctypes.sizeof(ctypes.c_int))
+        enabled = ctypes.c_int(1)
+        for attribute in DARK_MODE_ATTRIBUTES:
+            if ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    hwnd, attribute, ctypes.byref(enabled),
+                    ctypes.sizeof(enabled)) == 0:        # 0 is S_OK
+                break
+        # The frame is only repainted when the window next changes size, so
+        # nudge it by one pixel and back, or the bar stays white until the
+        # user happens to resize it.
+        window.update_idletasks()
+        width, height = window.winfo_width(), window.winfo_height()
+        if width > 1 and height > 1:
+            window.geometry(f"{width}x{height + 1}")
+            window.update_idletasks()
+            window.geometry(f"{width}x{height}")
+    except Exception:
+        pass
+
+
+def resource_path(relative: str) -> Path:
+    """Where a bundled file lives, whether we run from source or from the .exe.
+
+    PyInstaller unpacks a --onefile build into a temporary folder and records
+    it in sys._MEIPASS, so a plain "assets/icon.ico" would not be found there.
+    """
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return base / relative
+
+
+def set_window_icon(window: tk.Misc) -> None:
+    """Use our own icon instead of Tk's default feather. Never fatal."""
+    try:
+        ico = resource_path("assets/icon.ico")
+        if sys.platform == "win32" and ico.exists():
+            window.iconbitmap(default=str(ico))
+            return
+        png = resource_path("assets/icon.png")
+        if png.exists():
+            window._icon_image = tk.PhotoImage(file=str(png))
+            window.iconphoto(True, window._icon_image)
     except Exception:
         pass
 
@@ -146,7 +201,7 @@ class FotoRenamer:
         self.settings_file = renamer.app_data_dir() / "settings.json"
         self._restored_geometry = False
         self._make_variables()
-        self._load_settings()
+        self._saved = self._load_settings()
         self._build_styles()
         self._build_ui()
         self._register_dnd()
@@ -154,6 +209,10 @@ class FotoRenamer:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(120, self._poll_thumbnails)
         self._on_preset_change()
+        # _on_preset_change resets the clean-up switches to the preset's own
+        # defaults, so the switches the user saved have to be put back AFTER
+        # it runs - otherwise "remember my settings" silently does not.
+        self._restore_cleanup_switches()
         self._on_mode_change()
         self._on_insert_position_change()
         self.refresh_preview()
@@ -201,11 +260,20 @@ class FotoRenamer:
                     self.var_collapse):
             var.trace_add("write", self.schedule_preview)
 
-    def _load_settings(self) -> None:
+    def _restore_cleanup_switches(self) -> None:
+        for key, var in (("lower", self.var_lower), ("spaces", self.var_spaces),
+                         ("accents", self.var_accents),
+                         ("collapse", self.var_collapse)):
+            if isinstance(self._saved.get(key), bool):
+                var.set(self._saved[key])
+
+    def _load_settings(self) -> dict:
         try:
             data = json.loads(self.settings_file.read_text(encoding="utf-8"))
         except Exception:
-            return
+            return {}
+        if not isinstance(data, dict):
+            return {}
         mapping = {
             "preset": self.var_preset, "pattern": self.var_pattern,
             "event": self.var_event, "start": self.var_start,
@@ -224,12 +292,32 @@ class FotoRenamer:
                          ("collapse", self.var_collapse)):
             if isinstance(data.get(key), bool):
                 var.set(data[key])
-        if isinstance(data.get("geometry"), str):
+        geometry = self._onscreen_geometry(data.get("geometry"))
+        if geometry:
             try:
-                self.root.geometry(data["geometry"])
+                self.root.geometry(geometry)
                 self._restored_geometry = True
             except tk.TclError:
                 pass
+        return data
+
+    def _onscreen_geometry(self, geometry) -> str | None:
+        """Drop a saved position that would open the window off-screen.
+
+        Windows users unplug the second monitor the app was last on. Without
+        this the window reopens at coordinates nobody can reach.
+        """
+        if not isinstance(geometry, str):
+            return None
+        match = re.fullmatch(r"(\d+)x(\d+)([+-]\d+)([+-]\d+)", geometry.strip())
+        if not match:
+            return geometry if re.fullmatch(r"\d+x\d+", geometry.strip()) else None
+        width, height, x, y = (int(g) for g in match.groups())
+        screen_w, screen_h = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        # Keep the title bar reachable: at least 120x40 px of it must be visible.
+        if -width + 120 <= x <= screen_w - 120 and 0 <= y <= screen_h - 40:
+            return geometry
+        return f"{width}x{height}"
 
     def _save_settings(self) -> None:
         data = {
@@ -407,6 +495,7 @@ class FotoRenamer:
         self.tree.tag_configure("stripe", background=STRIPE)
         self.tree.tag_configure("unticked", foreground=MUTED)
         self.tree.tag_configure("conflict", foreground=RED)
+        self.tree.tag_configure("toolong", foreground=AMBER)
         self.tree.grid(row=0, column=0, sticky="nsew")
 
         bar = ttk.Scrollbar(wrapper, orient="vertical", command=self.tree.yview)
@@ -665,6 +754,10 @@ class FotoRenamer:
         notes = [f"{len(added)} added"]
         if skipped:
             notes.append(f"{skipped} skipped (not a photo or video)")
+        if not renamer.HEIC_SUPPORT and any(f.ext.lower() in renamer.HEIC_EXTS
+                                            for f in added):
+            notes.append("HEIC dates fall back to the file date "
+                         "(pip install pillow-heif to read them)")
         self.var_status.set(" · ".join(notes))
         self._populate_tree()
         self.refresh_preview()
@@ -798,6 +891,10 @@ class FotoRenamer:
             tags = ["stripe"] if index % 2 else []
             if not is_checked:
                 tags.append("unticked")
+            elif plan is not None and plan.too_long:
+                tags.append("conflict")
+            elif plan is not None and plan.truncated:
+                tags.append("toolong")
             elif plan is not None and plan.conflict:
                 tags.append("conflict")
             self.tree.item(iid, tags=tags,
@@ -818,6 +915,21 @@ class FotoRenamer:
     def _update_hint(self) -> None:
         if not self.plans:
             self.var_hint.set("")
+            return
+        # Windows' 260-character path limit outranks any style advice.
+        blocked = [p for p in self.plans if p.too_long]
+        if blocked:
+            self.var_hint.set(
+                f"⚠  {len(blocked)} file(s): the folder path is already too long "
+                f"for Windows — move the photos closer to the drive root")
+            self.lbl_hint.configure(style="Warn.TLabel")
+            return
+        shortened = [p for p in self.plans if p.truncated]
+        if shortened:
+            self.var_hint.set(
+                f"⚠  {len(shortened)} name(s) shortened to stay under Windows' "
+                f"260-character path limit")
+            self.lbl_hint.configure(style="Warn.TLabel")
             return
         stem = Path(self.plans[0].new_name).stem
         ok, message = renamer.check_convention(stem)
@@ -851,6 +963,9 @@ class FotoRenamer:
             return
         plan = self.plan_by_path.get(photo.path)
         source = "EXIF" if photo.from_exif else "file date"
+        if (not photo.from_exif and photo.ext.lower() in renamer.HEIC_EXTS
+                and not renamer.HEIC_SUPPORT):
+            source = "file date — install pillow-heif to read HEIC"
         self.lbl_preview_name.configure(text=photo.name)
         self.lbl_preview_meta.configure(
             text=f"{photo.taken_at.strftime('%d %b %Y · %H:%M:%S')}  ({source})\n"
@@ -864,8 +979,12 @@ class FotoRenamer:
         if photo is None:
             self._clear_thumbnail("Select a row")
             return
-        if photo.ext.lower() not in renamer.THUMBNAILABLE_EXTS:
-            self._clear_thumbnail(f"no preview for {photo.ext.lower()}")
+        ext = photo.ext.lower()
+        if ext not in renamer.THUMBNAILABLE_EXTS:
+            if ext in renamer.HEIC_EXTS:
+                self._clear_thumbnail("install pillow-heif\nto preview HEIC")
+            else:
+                self._clear_thumbnail(f"no preview for {ext}")
             return
         self._thumb_token += 1
         token = self._thumb_token
@@ -980,8 +1099,14 @@ class FotoRenamer:
             self.var_status.set(result.errors[0][1] or "Nothing to undo.")
         else:
             self._apply_name_changes(result.moved)
-            self.var_status.set(f"Undone — {len(result.renamed)} file"
-                                f"{'s' if len(result.renamed) != 1 else ''} restored")
+            message = (f"Undone — {len(result.renamed)} file"
+                       f"{'s' if len(result.renamed) != 1 else ''} restored")
+            if result.errors:
+                # The log keeps whatever could not be put back, so Undo stays
+                # live and a second press finishes the job.
+                message += (f" · {len(result.errors)} could not be restored "
+                            f"— press Undo again once they are free")
+            self.var_status.set(message)
         self._refresh_undo_button()
 
     def _apply_name_changes(self, moves: list[tuple[Path, Path]]) -> None:
@@ -1017,6 +1142,7 @@ def main() -> None:
     if sys.platform == "win32":
         # Match Tk's idea of a pixel to the monitor, so nothing looks tiny.
         root.tk.call("tk", "scaling", root.winfo_fpixels("1i") / 72.0)
+    set_window_icon(root)
     FotoRenamer(root)
     dark_title_bar(root)
     root.mainloop()
