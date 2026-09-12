@@ -6,10 +6,11 @@ without opening a window (see test_renamer.py).
 
 Reading order if you are learning the code:
     1. PhotoFile / read_taken_at ..... how a file on disk becomes data
-    2. expand_pattern ................ how "{date}_{event}_{n}" becomes text
-    3. apply_cleanup / sanitize_stem . how that text is made Windows/web safe
-    4. plan_renames .................. old name -> new name, for the preview
-    5. apply_renames / undo_last ..... the only two functions that touch disk
+    2. Stay / place_for .............. how a capture date becomes a place
+    3. expand_pattern ................ how "{date}_{event}_{n}" becomes text
+    4. apply_cleanup / sanitize_stem . how that text is made Windows/web safe
+    5. plan_renames .................. old name -> new name, for the preview
+    6. apply_renames / undo_last ..... the only two functions that touch disk
 """
 
 from __future__ import annotations
@@ -272,6 +273,86 @@ def backfill_exif_dates(files, *, on_result, should_stop=None) -> int:
 def sort_files(files: list[PhotoFile]) -> list[PhotoFile]:
     """Chronological order, falling back to Explorer-style name order."""
     return sorted(files, key=lambda f: f.sort_key)
+
+
+# --------------------------------------------------------------------------
+# 1b. Where you were, as data
+# --------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Stay:
+    """One period in one place: "I was in New York City on 15 Sep"."""
+
+    start: datetime
+    end: datetime          # inclusive, so a whole day ends at 23:59:59
+    place: str
+
+    @property
+    def span(self):
+        return self.end - self.start
+
+
+def place_for(taken_at: datetime, stays) -> str:
+    """The narrowest stay containing `taken_at`, or "" if none does.
+
+    Narrowest wins so a week in Boston and one afternoon at Fenway Park can
+    both be declared: the afternoon is the more specific answer for the photos
+    inside it. Ties keep the earlier stay, so the list order is a predictable
+    tie-break rather than an accident.
+
+    Pure and syscall-free: this runs once per ticked file on every keystroke.
+    """
+    best = None
+    for stay in stays:
+        if stay.start <= taken_at <= stay.end:
+            if best is None or stay.span < best.span:
+                best = stay
+    return best.place if best is not None else ""
+
+
+# The three shapes a moment may be typed in, longest first so "2026-09-15
+# 13:00" is never read as a bare date with trailing rubbish.
+_MOMENT_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d")
+
+
+def _parse_moment(text: str, *, label: str, end_of_day: bool) -> datetime:
+    """One side of a stay, or a ValueError a human can act on.
+
+    A bare date means the whole day: from 00:00:00, through 23:59:59. That is
+    what "I was there on the 15th" means, and it is the common case — the
+    time boxes exist only for the afternoon you want to name separately.
+    """
+    text = (text or "").strip()
+    if not text:
+        raise ValueError(f"type a {label} date — use 2026-09-15")
+    for fmt in _MOMENT_FORMATS:
+        try:
+            moment = datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+        if fmt == "%Y-%m-%d" and end_of_day:
+            return moment.replace(hour=23, minute=59, second=59)
+        return moment
+    raise ValueError(f"{text} is not a date — use 2026-09-15")
+
+
+def parse_stay(start_text: str, end_text: str, place: str) -> Stay:
+    """Build a Stay from what the user typed, or raise ValueError saying why.
+
+    Accepts "2026-09-15" or "2026-09-15 13:00". A bare start date means from
+    00:00; a bare end date means through 23:59:59.
+
+    Every message here ends up in the window's status line, so each one reads
+    as a sentence rather than a traceback.
+    """
+    place = (place or "").strip()
+    if not place:
+        raise ValueError("type a place first — New York City, say")
+    start = _parse_moment(start_text, label="start", end_of_day=False)
+    end = _parse_moment(end_text, label="end", end_of_day=True)
+    if end < start:
+        raise ValueError("the end is before the start — swap them round")
+    return Stay(start=start, end=end, place=place)
 
 
 # --------------------------------------------------------------------------

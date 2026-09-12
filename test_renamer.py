@@ -98,6 +98,109 @@ class TestTokens(unittest.TestCase):
         self.assertEqual(self.expand("{nope}_{n}"), "{nope}_014")
 
 
+class TestStays(unittest.TestCase):
+    """parse_stay turns two text boxes into a period, or says why it cannot."""
+
+    def test_a_bare_date_covers_the_whole_day(self):
+        stay = renamer.parse_stay("2026-09-15", "2026-09-15", "New York City")
+        self.assertEqual(stay.start, datetime(2026, 9, 15, 0, 0, 0))
+        self.assertEqual(stay.end, datetime(2026, 9, 15, 23, 59, 59))
+        self.assertEqual(stay.place, "New York City")
+
+    def test_a_date_and_time_is_taken_literally(self):
+        stay = renamer.parse_stay("2026-09-18 13:00", "2026-09-18 18:00", "Fenway Park")
+        self.assertEqual(stay.start, datetime(2026, 9, 18, 13, 0))
+        self.assertEqual(stay.end, datetime(2026, 9, 18, 18, 0))
+
+    def test_seconds_are_accepted_too(self):
+        stay = renamer.parse_stay("2026-09-18 13:00:30", "2026-09-18 18:00:45", "Fenway")
+        self.assertEqual(stay.start.second, 30)
+        self.assertEqual(stay.end.second, 45)
+
+    def test_a_multi_day_stay_runs_to_the_end_of_the_last_day(self):
+        stay = renamer.parse_stay("2026-09-16", "2026-09-20", "Boston")
+        self.assertEqual(stay.span.days, 4)
+        self.assertEqual(stay.end, datetime(2026, 9, 20, 23, 59, 59))
+
+    def test_junk_is_rejected_with_a_sentence_not_a_traceback(self):
+        with self.assertRaises(ValueError) as caught:
+            renamer.parse_stay("15/09/2026", "2026-09-15", "Boston")
+        self.assertEqual(str(caught.exception),
+                         "15/09/2026 is not a date — use 2026-09-15")
+
+    def test_a_word_where_a_date_should_be_is_rejected(self):
+        with self.assertRaises(ValueError) as caught:
+            renamer.parse_stay("2026-09-15", "yesterday", "Boston")
+        self.assertIn("not a date", str(caught.exception))
+
+    def test_a_missing_zero_is_forgiven_rather_than_scolded(self):
+        """strptime reads "2026-9-15" correctly, so refusing it would be
+        pedantry. Only text that has no date in it at all is an error."""
+        stay = renamer.parse_stay("2026-9-15", "2026-9-15", "Boston")
+        self.assertEqual(stay.start.date(), datetime(2026, 9, 15).date())
+
+    def test_a_missing_date_says_which_one(self):
+        with self.assertRaises(ValueError) as caught:
+            renamer.parse_stay("2026-09-15", "  ", "Boston")
+        self.assertIn("end date", str(caught.exception))
+
+    def test_a_missing_place_is_refused(self):
+        with self.assertRaises(ValueError) as caught:
+            renamer.parse_stay("2026-09-15", "2026-09-15", "   ")
+        self.assertIn("place", str(caught.exception))
+
+    def test_a_backwards_range_is_refused(self):
+        with self.assertRaises(ValueError) as caught:
+            renamer.parse_stay("2026-09-20", "2026-09-16", "Boston")
+        self.assertIn("before the start", str(caught.exception))
+
+    def test_surrounding_whitespace_is_forgiven(self):
+        stay = renamer.parse_stay("  2026-09-15 ", " 2026-09-15  ", "  Boston ")
+        self.assertEqual(stay.place, "Boston")
+        self.assertEqual(stay.start.day, 15)
+
+
+class TestPlaceResolution(unittest.TestCase):
+    """Which stay a photo belongs to, given the list the user typed."""
+
+    def setUp(self):
+        self.nyc = renamer.parse_stay("2026-09-15", "2026-09-15", "New York City")
+        self.boston = renamer.parse_stay("2026-09-16", "2026-09-20", "Boston")
+        self.fenway = renamer.parse_stay("2026-09-18 13:00", "2026-09-18 18:00",
+                                         "Fenway Park")
+        self.stays = (self.nyc, self.boston, self.fenway)
+
+    def place(self, when: str) -> str:
+        return renamer.place_for(datetime.fromisoformat(when), self.stays)
+
+    def test_a_photo_inside_one_stay_gets_it(self):
+        self.assertEqual(self.place("2026-09-15 09:30"), "New York City")
+        self.assertEqual(self.place("2026-09-17 09:30"), "Boston")
+
+    def test_the_narrowest_overlapping_stay_wins(self):
+        self.assertEqual(self.place("2026-09-18 14:00"), "Fenway Park")
+        self.assertEqual(self.place("2026-09-18 19:00"), "Boston")
+
+    def test_the_boundaries_are_inclusive(self):
+        self.assertEqual(self.place("2026-09-15 00:00:00"), "New York City")
+        self.assertEqual(self.place("2026-09-15 23:59:59"), "New York City")
+
+    def test_no_match_is_an_empty_string_not_an_error(self):
+        self.assertEqual(self.place("2026-09-14 12:00"), "")
+        self.assertEqual(self.place("2026-09-21 12:00"), "")
+
+    def test_no_stays_at_all_is_an_empty_string(self):
+        self.assertEqual(renamer.place_for(datetime(2026, 9, 15), ()), "")
+
+    def test_a_tie_keeps_the_earlier_stay_in_the_list(self):
+        first = renamer.parse_stay("2026-09-15", "2026-09-15", "Museum")
+        second = renamer.parse_stay("2026-09-15", "2026-09-15", "Park")
+        self.assertEqual(
+            renamer.place_for(datetime(2026, 9, 15, 12), (first, second)), "Museum")
+        self.assertEqual(
+            renamer.place_for(datetime(2026, 9, 15, 12), (second, first)), "Park")
+
+
 class TestCleanupAndSafety(unittest.TestCase):
 
     def test_accents_spaces_case(self):
