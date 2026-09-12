@@ -74,9 +74,11 @@ every new name before anything touches disk and a one-click undo.
 
 ## Current work
 
-`ARCHITECTURE_PLAN.md` is **done** — the `{place}` token, the Place panel, the two
-capture-date fixes it depended on, and the scandir rewrite of the scan. Its measured
-outcomes are recorded in the file itself. Nothing in it is outstanding.
+Nothing outstanding. The last planned round — the `{place}` token, the Place panel,
+the two capture-date fixes it depended on, and the scandir rewrite of the scan — is
+done and shipped. Its plan and measured outcomes were kept in `ARCHITECTURE_PLAN.md`,
+now deleted as spent; read it at `git show 034f6e1:ARCHITECTURE_PLAN.md` if you ever
+need the reasoning.
 
 Since then, the **token strip**: the pattern drawn as blocks you drag into a
 new order, with the example line coloured to match. Three things it left
@@ -122,7 +124,8 @@ things it left behind are worth knowing before editing the core:
 ## Reference repos — where the architecture ideas came from
 
 The open-source bulk renamers this project was compared against, highest-starred first
-(star counts as of September 2026). `ARCHITECTURE_PLAN.md` cites these by name.
+(star counts as of September 2026). Worth knowing before proposing anything new here:
+each idea below arrived from a named peer, not from taste.
 
 - **[exiftool/exiftool](https://github.com/exiftool/exiftool)** — 5.0k ★, Perl. The metadata
   engine nearly every other photo tool shells out to; 225 format modules, renames from any tag.
