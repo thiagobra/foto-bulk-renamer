@@ -539,6 +539,27 @@ def sc_screenshots(outdir):
     pump(a.root, 12)
     shot(a.root, outdir / "07-long-name-capped.png")
     a.root.destroy()
+
+    # The Place panel, open, with a trip declared over the cardC photos.
+    wipe_settings()
+    b = new_app()
+    b.root.geometry("1200x1050+0+0")
+    b.add_paths([str(FIX / "cardC")])
+    b.wait_for_dates()
+    b.var_event.set("trip")
+    b.var_place_open.set(True); b._sync_place_panel()
+    for city, start, end in (("New York City", "2026-09-15", "2026-09-15"),
+                             ("Boston", "2026-09-16", "2026-09-20"),
+                             ("Fenway Park", "2026-09-17", "2026-09-17")):
+        b.var_city.set(city)
+        b.var_from_date.set(start); b.var_to_date.set(end)
+        b.var_from_time.set("13:00" if city == "Fenway Park" else "00:00")
+        b.var_to_time.set("18:00" if city == "Fenway Park" else "23:59")
+        b._add_stay()
+    b.tree.selection_set("0"); b._show_thumbnail()
+    for _ in range(40): pump(b.root); b._poll_thumbnails()
+    shot(b.root, outdir / "08-place-panel.png")
+    b.root.destroy()
     print("   ", sorted(p.name for p in outdir.glob("*.png")))
 
 # ---------------------------------------------------------------------------

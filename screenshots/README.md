@@ -11,6 +11,7 @@ The app as it actually runs, captured from the committed code.
 | [`05-convention-warning.png`](05-convention-warning.png) | The convention check turning amber — `⚠ spaces in name` — after the lowercase and hyphen switches were turned off. It warns, it never blocks. |
 | [`06-after-rename-undo-available.png`](06-after-rename-undo-available.png) | Straight after renaming: the list shows the new names, **Undo last rename** is enabled, **RENAME** is greyed out because nothing is left to change, and the status reads `Renamed 8 files · undo is available`. |
 | [`07-long-name-capped.png`](07-long-name-capped.png) | The Windows path-length guard. A very long Event name turns every affected row amber and shows `⚠ 8 name(s) shortened to stay under Windows' 260-character path limit`. The names are cut before anything touches the disk, not attempted and failed. |
+| [`08-place-panel.png`](08-place-panel.png) | The **Place** panel open, with a trip declared: 15 Sep in New York City, 16–20 Sep in Boston, and one afternoon at Fenway Park. The narrower stay wins inside it, so the `{place}` at the end of the pattern resolves per photo — the line beside *Position* is the first ticked file as it will come out. Closed, the panel is the one-line strip in `01-new-name-mode.png`. |
 
 ## A note on how these were captured
 
