@@ -67,3 +67,35 @@ Two things it leaves behind that are worth knowing before editing the core:
 - **`plan_renames()` and `sort_files()` must make no syscalls** when handed a warm
   `DirectoryIndex`. `TestPreviewTouchesNoDisk` enforces that; if it fails, something
   has put the filesystem back on the per-keystroke path.
+
+## Reference repos — where the architecture ideas came from
+
+The open-source bulk renamers this project was compared against, highest-starred first
+(star counts as of September 2026). `ARCHITECTURE_PLAN.md` cites these by name.
+
+- **[exiftool/exiftool](https://github.com/exiftool/exiftool)** — 5.0k ★, Perl. The metadata
+  engine nearly every other photo tool shells out to; 225 format modules, renames from any tag.
+- **[tfeldmann/organize](https://github.com/tfeldmann/organize)** — 3.1k ★, Python. YAML rule
+  engine (locations → filters → actions) where renaming is just one action; `sim` mode, no undo.
+- **[ayoisaiah/f2](https://github.com/ayoisaiah/f2)** — 2.4k ★, Go. The closest functional twin:
+  dry-run by default, JSON undo backup, EXIF/ID3 template variables.
+  *Source of A1* — its `internal/file.Change` resolves paths once in the `find` stage and no
+  later stage touches the filesystem.
+- **[jmathai/elodie](https://github.com/jmathai/elodie)** — 1.5k ★, Python. Photo library
+  organizer driven by a config.ini of placeholders; checksum DB for dedupe, no undo.
+  *Source of A3* — runs exiftool as a persistent `-stay_open` subprocess to keep per-file
+  metadata reads off the critical path (`elodie/external/pyexiftool.py`).
+- **[laurent22/massren](https://github.com/laurent22/massren)** — 1.4k ★, Go. Renames by letting
+  you edit the filenames in `$EDITOR`; SQLite undo history, UUID intermediate paths for swaps.
+  *Source of A2* — keeps authoritative name state in a store (`history.go`) instead of
+  re-listing the directory.
+
+Also looked at, did not make the top five:
+
+- **[andrewning/sortphotos](https://github.com/andrewning/sortphotos)** — 1.1k ★, Python.
+  Sorts photos into date-based folder hierarchies via exiftool; optional `--rename`.
+- **[ivandokov/phockup](https://github.com/ivandokov/phockup)** — 1.0k ★, Python. Organizes
+  into `YYYY/MM/DD` via exiftool, with checksum-based duplicate handling.
+- **[microsoft/PowerToys → PowerRename](https://github.com/microsoft/PowerToys/tree/main/src/modules/powerrename)**
+  — 139k ★ (whole suite), C++. The only mainstream GUI peer with the same live-preview-plus-undo
+  model, built as a Windows Explorer shell extension rather than a standalone app.
