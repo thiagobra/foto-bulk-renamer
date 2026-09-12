@@ -214,8 +214,8 @@ was cleared.
 
 ## Tested on
 
-| | |
-|---|---|
-| Logic (76 unit tests) | Windows and Linux, Python 3.10 and 3.12, on every push (CI) |
-| The real window | Linux, headless, on every push (CI); and by hand via `tools/gui_drive_full.py` |
-| Windows desktop behaviour | **Not yet verified on a real Windows machine.** The DPI, dark-title-bar, `run.bat` and PyInstaller paths are reviewed and unit-tested where testable, but no one has double-clicked `run.bat` on Windows yet. |
+| | Where | Status |
+|---|---|---|
+| Logic — 76 unit tests | Windows **and** Linux, Python 3.10 and 3.12 | ✅ green on every push (CI). This includes the rules that only behave like Windows *on* Windows: the 260-character path cap, reserved names (`CON`, `NUL`), and case-only renames such as `IMG_0001.JPG` → `img_0001.jpg`. |
+| The real window | Linux, headless | ✅ green on every push (CI), plus a 57-check manual sweep via `tools/gui_drive_full.py` |
+| Windows **desktop** behaviour | a real Windows PC | ⚠️ **Not verified.** DPI awareness, the dark title bar, double-clicking `run.bat`, and the PyInstaller `.exe` cannot be exercised by a CI runner with no desktop session. They are reviewed against the Windows API docs and asserted where a file can be asserted (`test_packaging.py` checks the batch files' CRLF endings, block syntax and build flags), but nobody has yet double-clicked `run.bat` on Windows. That is the one remaining gap. |
