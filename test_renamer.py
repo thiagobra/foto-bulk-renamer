@@ -753,5 +753,164 @@ class TestScanResilience(unittest.TestCase):
             self.assertEqual(skipped, 1)
 
 
+class TestDirectoryIndex(unittest.TestCase):
+    """The index is a cache of a folder listing. These are the ways a cache
+    goes wrong: it misses a change we made, it blocks a name we just freed,
+    or it never notices a change somebody else made."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_it_lists_a_directory_once(self):
+        (self.dir / "a.jpg").write_bytes(b"x")
+        index = renamer.DirectoryIndex()
+        index.ensure({self.dir})
+        self.assertEqual(index.names_for(self.dir), {"a.jpg"})
+
+    def test_names_are_lowercased_because_windows_compares_that_way(self):
+        (self.dir / "SHOUTING.JPG").write_bytes(b"x")
+        index = renamer.DirectoryIndex()
+        index.ensure({self.dir})
+        self.assertEqual(index.names_for(self.dir), {"shouting.jpg"})
+
+    def test_an_unreadable_directory_reads_as_empty_not_an_error(self):
+        index = renamer.DirectoryIndex()
+        index.ensure({self.dir / "does-not-exist"})
+        self.assertEqual(index.names_for(self.dir / "does-not-exist"), set())
+
+    def test_apply_moves_keeps_the_index_true(self):
+        (self.dir / "old.jpg").write_bytes(b"x")
+        index = renamer.DirectoryIndex()
+        index.ensure({self.dir})
+        index.apply_moves([(self.dir / "old.jpg", self.dir / "new.jpg")])
+        self.assertEqual(index.names_for(self.dir), {"new.jpg"})
+
+    def test_invalidate_picks_up_a_file_created_behind_our_back(self):
+        index = renamer.DirectoryIndex()
+        index.ensure({self.dir})
+        self.assertEqual(index.names_for(self.dir), set())
+        (self.dir / "appeared.jpg").write_bytes(b"x")   # as if from Explorer
+        index.ensure({self.dir})                        # already listed: no re-read
+        self.assertEqual(index.names_for(self.dir), set())
+        index.invalidate()
+        index.ensure({self.dir})
+        self.assertEqual(index.names_for(self.dir), {"appeared.jpg"})
+
+    def test_a_name_the_batch_is_vacating_can_be_taken_by_another_file(self):
+        """The real a -> b, b -> a swap.
+
+        Both target names are sitting on disk right now, so a naive "is this
+        name taken?" says yes to both and de-duplicates them into swap_1 (1)
+        and swap_2 (1). They are not collisions: this same batch is giving
+        both names up. Chronological order puts swap_2 first, so the two
+        files exchange names.
+        """
+        write_jpeg(self.dir / "swap_1.jpg", exif_date="2026:06:12 15:00:00")
+        write_jpeg(self.dir / "swap_2.jpg", exif_date="2026:06:12 14:00:00")
+        files = renamer.sort_files(renamer.scan_paths([self.dir])[0])
+        self.assertEqual([f.name for f in files], ["swap_2.jpg", "swap_1.jpg"])
+
+        plans = renamer.plan_renames(
+            files, RenameSettings(pattern="{event}_{n}", event="swap", digits=1))
+        self.assertEqual([(p.photo.name, p.new_name) for p in plans],
+                         [("swap_2.jpg", "swap_1.jpg"),
+                          ("swap_1.jpg", "swap_2.jpg")])
+        self.assertFalse(any(p.conflict for p in plans),
+                         "a name this batch is giving up was treated as taken")
+
+    def test_a_file_outside_the_batch_still_blocks_the_name(self):
+        write_jpeg(self.dir / "IMG_0001.jpg", exif_date="2026:06:12 14:22:33")
+        (self.dir / "swap_1.jpg").write_bytes(b"not ours")
+        files, _ = renamer.scan_paths([self.dir / "IMG_0001.jpg"])
+        plans = renamer.plan_renames(
+            files, RenameSettings(pattern="{event}_{n}", event="swap", digits=1))
+        self.assertEqual(plans[0].new_name, "swap_1 (1).jpg")
+        self.assertTrue(plans[0].conflict)
+
+    def test_a_supplied_index_gives_the_same_answer_as_no_index(self):
+        for i in (1, 2, 3):
+            write_jpeg(self.dir / f"IMG_000{i}.jpg",
+                       exif_date=f"2026:06:12 14:2{i}:00")
+        (self.dir / "2026-06-12_beach_002.jpg").write_bytes(b"in the way")
+        files = renamer.sort_files(renamer.scan_paths([self.dir])[0])
+        settings = RenameSettings(event="beach")
+
+        index = renamer.DirectoryIndex()
+        self.assertEqual(
+            [p.new_name for p in renamer.plan_renames(files, settings)],
+            [p.new_name for p in renamer.plan_renames(files, settings, index=index)])
+
+
+class TestPreviewTouchesNoDisk(unittest.TestCase):
+    """The contract that stops this regressing silently.
+
+    plan_renames() and sort_files() run on every keystroke. Given a directory
+    index that is already populated, they must perform no filesystem calls at
+    all — so the cost of the live preview depends on how many photos you are
+    renaming, never on how many files share the folder.
+    """
+
+    def _counting_run(self, body):
+        """Run `body` with os.scandir and Path.resolve counted."""
+        calls = {"scandir": 0, "resolve": 0}
+        real_scandir, real_resolve = os.scandir, Path.resolve
+
+        def counting_scandir(*args, **kwargs):
+            calls["scandir"] += 1
+            return real_scandir(*args, **kwargs)
+
+        def counting_resolve(self, *args, **kwargs):
+            calls["resolve"] += 1
+            return real_resolve(self, *args, **kwargs)
+
+        os.scandir = counting_scandir
+        Path.resolve = counting_resolve
+        try:
+            body()
+        finally:
+            os.scandir = real_scandir
+            Path.resolve = real_resolve
+        return calls
+
+    def test_planning_with_a_warm_index_makes_no_syscalls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            files = [PhotoFile(path=directory / f"IMG_{i:04d}.jpg",
+                               taken_at=datetime(2026, 6, 12, 14, 0, i),
+                               size=1234)
+                     for i in range(50)]
+            index = renamer.DirectoryIndex()
+            index.ensure({directory})          # the one listing, taken up front
+            settings = RenameSettings(event="beach")
+
+            calls = self._counting_run(
+                lambda: renamer.plan_renames(files, settings, index=index))
+
+        self.assertEqual(calls["scandir"], 0,
+                         "plan_renames re-listed the directory")
+        self.assertEqual(calls["resolve"], 0,
+                         "plan_renames resolved a path on the hot path")
+
+    def test_sorting_makes_no_syscalls(self):
+        files = [PhotoFile(path=Path(f"/tmp/IMG_{i}.jpg"),
+                           taken_at=datetime(2026, 6, 12, 14, 0, i),
+                           size=1)
+                 for i in range(50)]
+        calls = self._counting_run(lambda: renamer.sort_files(files))
+        self.assertEqual(calls["resolve"], 0,
+                         "sort_files resolved a path instead of using sort_key")
+
+    def test_a_photofile_resolves_its_path_exactly_once(self):
+        calls = self._counting_run(
+            lambda: PhotoFile(path=Path("/tmp/IMG_0001.jpg"),
+                              taken_at=datetime(2026, 6, 12, 14, 22, 33),
+                              size=1))
+        self.assertEqual(calls["resolve"], 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

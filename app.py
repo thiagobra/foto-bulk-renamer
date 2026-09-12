@@ -191,6 +191,9 @@ class FotoRenamer:
         self.checked: set[Path] = set()          # resolved paths that are ticked
         self.plans: list[renamer.RenamePlan] = []
         self.plan_by_path: dict[Path, renamer.RenamePlan] = {}
+        # One folder listing, reused across keystrokes instead of re-read on
+        # each one. Kept in step by apply_moves, thrown away by invalidate.
+        self.dir_index = renamer.DirectoryIndex()
 
         self._preview_job: str | None = None
         self._thumb_token = 0
@@ -207,6 +210,9 @@ class FotoRenamer:
         self._register_dnd()
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        # Coming back from Explorer is the likeliest moment for the folder to
+        # have changed behind us, so drop the cached listing and re-plan.
+        self.root.bind("<FocusIn>", self._on_focus_in, add="+")
         self.root.after(120, self._poll_thumbnails)
         self._on_preset_change()
         # _on_preset_change resets the clean-up switches to the preset's own
@@ -892,7 +898,8 @@ class FotoRenamer:
         self._preview_job = None
         settings = self.current_settings()
         ticked = [f for f in self.files if f.resolved in self.checked]
-        self.plans = renamer.plan_renames(ticked, settings) if ticked else []
+        self.plans = (renamer.plan_renames(ticked, settings, index=self.dir_index)
+                      if ticked else [])
         self.plan_by_path = {p.photo.path: p for p in self.plans}
 
         for index, photo in enumerate(self.files):
@@ -924,6 +931,13 @@ class FotoRenamer:
         self.button_rename.state(["!disabled"] if changing else ["disabled"])
         self._update_hint()
         self._update_preview_labels()
+
+    def _on_focus_in(self, event) -> None:
+        """The window (not just a widget inside it) got focus again."""
+        if event.widget is not self.root:
+            return
+        self.dir_index.invalidate()
+        self.schedule_preview()
 
     def _update_hint(self) -> None:
         if not self.plans:
@@ -1083,6 +1097,14 @@ class FotoRenamer:
     # -- the two actions that touch disk ------------------------------------
 
     def do_rename(self) -> None:
+        # The index is a cache of a folder listing, and a file can have
+        # appeared in Explorer since it was taken. Everywhere else a stale
+        # listing only costs an ugly preview; here it could mean missing a
+        # collision and overwriting someone's file. So re-list and re-plan
+        # once, and commit that. One scandir at commit time is irrelevant.
+        self.dir_index.invalidate()
+        self.refresh_preview()
+
         changing = [p for p in self.plans if p.changed]
         if not changing:
             self.var_status.set("Nothing to rename — the names already match.")
@@ -1125,6 +1147,8 @@ class FotoRenamer:
         """
         # These resolve() calls happen once per rename, not per keystroke, so
         # they stay: the moves come back from disk as plain paths.
+        # Fold the moves into the index before anything re-plans against it.
+        self.dir_index.apply_moves(moves)
         moved = {old.resolve(): new for old, new in moves}
         for photo in self.files:
             resolved = photo.resolved

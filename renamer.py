@@ -481,35 +481,98 @@ class RenamePlan:
         return self.photo.path.with_name(self.new_name)
 
 
-def _existing_names(directories: set[Path], batch: set[Path]) -> dict[Path, set[str]]:
-    """Names already on disk per directory, ignoring the files we are renaming.
+# Returned for a directory that was never listed, so names_for() can hand out
+# something read-only instead of raising or quietly inserting an empty set.
+_NO_NAMES: frozenset[str] = frozenset()
 
-    Windows compares names case-insensitively, so we store them lowercased.
+
+class DirectoryIndex:
+    """Which names are already taken, per directory.
+
+    plan_renames() runs on every keystroke. Re-listing the folder each time
+    means a 3,000-photo folder costs 3,000 directory entries just to rename
+    twenty files, and the cost grows with the folder rather than with the job.
+    So the listing is taken once and then kept in step with our own renames.
+
+    Names are stored lowercased because Windows compares them that way, and
+    within a single directory a name is unique — which is why comparing names
+    is both correct and free, where the old code resolved every entry to a
+    full path first.
+
+    This is a cache of something another program can change underneath us.
+    See invalidate(), and see FotoRenamer.do_rename for where that matters.
     """
-    taken: dict[Path, set[str]] = {}
-    for directory in directories:
-        names = set()
-        try:
-            with os.scandir(directory) as entries:
-                for entry in entries:
-                    if Path(entry.path).resolve() not in batch:
+
+    def __init__(self) -> None:
+        self._names: dict[Path, set[str]] = {}
+
+    def ensure(self, directories) -> None:
+        """List any of `directories` not seen yet. The only disk access here."""
+        for directory in directories:
+            if directory in self._names:
+                continue
+            names: set[str] = set()
+            try:
+                with os.scandir(directory) as entries:
+                    for entry in entries:
                         names.add(entry.name.lower())
-        except OSError:
-            pass
-        taken[directory] = names
-    return taken
+            except OSError:
+                # Unplugged card, or a folder we are not allowed to read. An
+                # empty listing just means nothing is known to be in the way.
+                pass
+            self._names[directory] = names
+
+    def names_for(self, directory: Path) -> frozenset[str] | set[str]:
+        """The lowercased names taken in `directory`.
+
+        Borrowed, not copied: read it, never mutate it. Use apply_moves() to
+        record a change.
+        """
+        return self._names.get(directory, _NO_NAMES)
+
+    def apply_moves(self, moves) -> None:
+        """Fold our own completed renames in, so the index stays true."""
+        for old, new in moves:
+            freed = self._names.get(old.parent)
+            if freed is not None:
+                freed.discard(old.name.lower())
+            taken = self._names.get(new.parent)
+            if taken is not None:
+                taken.add(new.name.lower())
+
+    def invalidate(self) -> None:
+        """Forget everything; the next ensure() re-reads from disk."""
+        self._names.clear()
 
 
-def plan_renames(files: list[PhotoFile], settings: RenameSettings) -> list[RenamePlan]:
+def plan_renames(files: list[PhotoFile], settings: RenameSettings, *,
+                 index: DirectoryIndex | None = None) -> list[RenamePlan]:
     """Build the full old -> new list, with collisions already resolved.
 
     `files` must already be in the order the numbers should follow
-    (use sort_files). Nothing here touches the disk except reading directory
-    listings to spot collisions.
+    (use sort_files).
+
+    Pass `index` to reuse a directory listing across calls — that is what the
+    live preview does, and it is the difference between a keystroke costing a
+    folder scan and costing nothing. Leave it out and one is built and thrown
+    away, which is exactly the old behaviour, so every existing caller and
+    test keeps working unchanged.
     """
-    batch = {f.resolved for f in files}
+    index = index or DirectoryIndex()
     directories = {f.path.parent for f in files}
-    taken = _existing_names(directories, batch)
+    index.ensure(directories)
+
+    # Three name sets decide whether a candidate is free, and none of them
+    # touches the disk:
+    #   existing  - what the index says is already in that folder
+    #   vacating  - names this batch is giving up there, so they are fair game
+    #               (this is what makes the a.jpg -> b.jpg, b.jpg -> a.jpg
+    #               swap work instead of colliding with itself)
+    #   claimed   - names this run has already handed out
+    vacating: dict[Path, set[str]] = {d: set() for d in directories}
+    claimed: dict[Path, set[str]] = {d: set() for d in directories}
+    for photo in files:
+        vacating[photo.path.parent].add(photo.name.lower())
 
     plans: list[RenamePlan] = []
     for offset, photo in enumerate(files):
@@ -523,14 +586,23 @@ def plan_renames(files: list[PhotoFile], settings: RenameSettings) -> list[Renam
         too_long = truncated and len(str(directory / (stem + ext))) > MAX_PATH_USABLE
         candidate = stem + ext
 
+        existing = index.names_for(directory)
+        free_again = vacating[directory]
+        taken_here = claimed[directory]
+
         # Explorer-style de-duplication: name (1).jpg, name (2).jpg …
+        # Three set lookups per try, no function call and no syscall — this
+        # loop runs once per ticked file on every keystroke.
+        lowered = candidate.lower()
         conflict = False
         counter = 1
-        while candidate.lower() in taken[directory]:
+        while (lowered in taken_here
+               or (lowered in existing and lowered not in free_again)):
             conflict = True
             candidate = f"{stem} ({counter}){ext}"
+            lowered = candidate.lower()
             counter += 1
-        taken[directory].add(candidate.lower())
+        taken_here.add(lowered)
         plans.append(RenamePlan(photo=photo, new_name=candidate, conflict=conflict,
                                 truncated=truncated and not too_long,
                                 too_long=too_long))
