@@ -45,13 +45,33 @@ def make_photo(stem: str, ext: str = ".jpg",
                      size=1234)
 
 
-def write_jpeg(path: Path, *, exif_date: str | None = None, colour=(70, 90, 120)):
-    """Create a tiny real JPEG, optionally carrying a real EXIF capture date."""
+def write_jpeg(path: Path, *, exif_date: str | None = None, colour=(70, 90, 120),
+               original: str | None = None, created: str | None = None,
+               modified: str | None = None):
+    """Create a tiny real JPEG, optionally carrying real EXIF capture dates.
+
+    exif_date writes the ordinary case: the same value as DateTimeOriginal and
+    DateTime, which is what a camera straight off the card looks like. The
+    three per-tag keywords exist for the awkward cases — "CreateDate present,
+    DateTimeOriginal absent" cannot be expressed any other way.
+
+        original  36867 DateTimeOriginal, in the Exif sub-IFD
+        created   36868 CreateDate,       in the Exif sub-IFD
+        modified  306   DateTime,         in IFD0
+    """
     img = Image.new("RGB", (24, 18), colour)
     if exif_date:
+        original = exif_date if original is None else original
+        modified = exif_date if modified is None else modified
+    if original or created or modified:
         exif = img.getexif()
-        exif[306] = exif_date                      # DateTime, in IFD0
-        exif.get_ifd(0x8769)[36867] = exif_date    # DateTimeOriginal, Exif IFD
+        sub = exif.get_ifd(0x8769)
+        if original:
+            sub[36867] = original
+        if created:
+            sub[36868] = created
+        if modified:
+            exif[306] = modified
         img.save(path, exif=exif)
     else:
         img.save(path)
@@ -892,6 +912,52 @@ class TestHeicSupport(unittest.TestCase):
             taken, from_exif = renamer.read_taken_at(path)
             self.assertTrue(from_exif)
             self.assertEqual(taken, datetime(2026, 6, 12, 14, 22, 33))
+
+
+class TestDateChain(unittest.TestCase):
+    """Which EXIF tag wins, and why it matters.
+
+    exiftool's canonical order is DateTimeOriginal, then CreateDate, then
+    ModifyDate. ModifyDate is rewritten by every editor a photo passes
+    through, so trusting it over CreateDate dates a June photo to September.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def taken(self, path: Path):
+        taken_at, from_exif = renamer.read_taken_at(path)
+        self.assertTrue(from_exif, "fell back to the file's modified time")
+        return taken_at
+
+    def test_create_date_beats_modify_date(self):
+        """The regression test: an edited photo used to take its edit date."""
+        path = self.dir / "edited.jpg"
+        write_jpeg(path, created="2026:06:12 14:22:33",
+                   modified="2026:09:01 08:00:00")
+        self.assertEqual(self.taken(path), datetime(2026, 6, 12, 14, 22, 33))
+
+    def test_date_time_original_still_beats_both(self):
+        path = self.dir / "camera.jpg"
+        write_jpeg(path, original="2026:06:12 14:22:33",
+                   created="2026:06:12 14:22:40",
+                   modified="2026:09:01 08:00:00")
+        self.assertEqual(self.taken(path), datetime(2026, 6, 12, 14, 22, 33))
+
+    def test_modify_date_is_still_used_when_it_is_all_there_is(self):
+        path = self.dir / "scan.jpg"
+        write_jpeg(path, modified="2026:09:01 08:00:00")
+        self.assertEqual(self.taken(path), datetime(2026, 9, 1, 8, 0, 0))
+
+    def test_no_exif_at_all_falls_back_to_the_file_date(self):
+        path = self.dir / "plain.jpg"
+        write_jpeg(path)
+        _, from_exif = renamer.read_taken_at(path)
+        self.assertFalse(from_exif)
 
 
 class TestScanResilience(unittest.TestCase):

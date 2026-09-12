@@ -159,10 +159,17 @@ def read_taken_at(path: Path, *, use_exif: bool = True) -> tuple[datetime, bool]
                 exif = img.getexif()
                 # Real cameras write DateTimeOriginal (36867) into the Exif
                 # sub-IFD (0x8769), and usually DateTime (306) into IFD0 too.
+                # The order is exiftool's canonical chain. CreateDate (36868,
+                # "DateTimeDigitized" in the EXIF spec) used to be skipped,
+                # which handed any photo that had been through Google Photos,
+                # WhatsApp or a resize tool its EDIT date instead of its
+                # capture date — and with {place}, a wrong date is a wrong city.
+                sub = exif.get_ifd(0x8769)
                 candidates = [
-                    exif.get_ifd(0x8769).get(36867),   # when the shutter fired
-                    exif.get(306),                     # when the file was written
-                    exif.get(36867),                   # some apps write it here
+                    sub.get(36867),    # DateTimeOriginal — when the shutter fired
+                    sub.get(36868),    # CreateDate — when it was digitised
+                    exif.get(306),     # ModifyDate — any editor rewrites this
+                    exif.get(36867),   # some apps write DateTimeOriginal up here
                 ]
                 for raw in candidates:
                     if raw:
