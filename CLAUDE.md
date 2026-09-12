@@ -37,7 +37,7 @@ every new name before anything touches disk and a one-click undo.
 | `renamer.py` | **Pure core.** Scanning, EXIF dates, pattern expansion, collision planning, the two-phase rename, the undo log. Imports no `tkinter` — keep it that way. |
 | `app.py` | The Tk window. A shell over `renamer.py`; it should hold no naming logic. |
 | `presets.py` | Naming presets as plain frozen dataclasses. Adding one is a two-line edit. |
-| `test_renamer.py` | 86 unit tests over the core, no window needed. |
+| `test_renamer.py` | 138 unit tests over the core, no window needed. |
 | `tools/gui_smoke.py`, `tools/gui_drive_full.py` | Headless GUI drives. CI runs the first one. |
 | `tools/bench.py` | Times the live preview against the old approach. Not a test; CI ignores it. |
 
@@ -45,7 +45,7 @@ every new name before anything touches disk and a one-click undo.
 
 - **The core stays GUI-free.** Anything that can be tested without a window belongs in
   `renamer.py`.
-- **Never break the existing tests to make a change fit.** All 96 must stay green; if a
+- **Never break the existing tests to make a change fit.** All 148 must stay green; if a
   change needs a test edited, say so explicitly rather than quietly rewriting it.
 - **The GUI's design and layout are settled.** Do not restyle, re-lay-out or "improve" the
   interface unless asked. Internal wiring changes are fine.
@@ -55,13 +55,25 @@ every new name before anything touches disk and a one-click undo.
 
 ## Current work
 
-`ARCHITECTURE_PLAN.md` is **planned, not started** — the `{place}` token that names a
-photo after where you were, plus the two capture-date fixes it depends on (EXIF
-`CreateDate` was being skipped in favour of the edit time; videos had no date read at
-all). Read it before touching the metadata layer.
+`ARCHITECTURE_PLAN.md` is **done** — the `{place}` token, the Place panel, the two
+capture-date fixes it depended on, and the scandir rewrite of the scan. Its measured
+outcomes are recorded in the file itself. Nothing in it is outstanding.
 
-The previous round of work in that file — compute-once fields, the injected directory
-index, the threaded EXIF backfill — is **done**, and its measured before/after numbers
+Four things that round left behind, on top of the two below:
+
+- **A photo's date now comes from a chain, not one tag**: `DateTimeOriginal`,
+  `CreateDate`, `ModifyDate` for images, and the container's own boxes for videos.
+  `from_exif` means "came from embedded metadata", which for a clip is not EXIF.
+- **`place_for()` runs once per ticked file on every keystroke**, so it must stay
+  pure and syscall-free, like everything else on that path.
+- **The Place panel folds away.** It is 216px tall, which at the default window size
+  would cost the file list five of its nine rows, so opening it grows the window
+  rather than squeezing the table.
+- **`{place}`'s position is the pattern text**, not a mode. The Position dropdown
+  rewrites `var_pattern`; nothing in `renamer.py` knows where a place goes.
+
+The round before that — compute-once fields, the injected directory index, the
+threaded EXIF backfill — is also done, and its measured before/after numbers
 (an 80x preview speed-up) are in git at `git show 2625218:ARCHITECTURE_PLAN.md`. Two
 things it left behind are worth knowing before editing the core:
 

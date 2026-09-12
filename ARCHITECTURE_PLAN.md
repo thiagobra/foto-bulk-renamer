@@ -4,13 +4,38 @@ Name photos after where you were. One feature, plus the two date fixes it depend
 The GUI gains one panel; the core gains one token. Everything else from the exiftool
 comparison is deliberately parked, and the reasons are recorded in `## Out of scope`.
 
-## Status: planned
+## Status: done
 
-Nothing here is implemented yet. The previous plan in this file — A1 compute-once
-fields, A2 the injected directory index, A3 the threaded EXIF backfill, A4 the tests
-and bench that keep them honest — is done, and its measured before/after numbers
-(an 80x preview speed-up) are in git at `git show 2625218:ARCHITECTURE_PLAN.md`.
-Two things it left behind still bind anything written below:
+All seven commits landed. What the work actually produced, measured rather than
+predicted:
+
+| | Before | After |
+|---|---|---|
+| An edited photo's date (`CreateDate` 12 Jun, `ModifyDate` 1 Sep) | 1 Sep | **12 Jun** |
+| A clip's date (real time 2026-06-12 14:22:33) | 2026-05-28 20:26:40, 15 days off | **2026-06-12 14:22:33** |
+| `scan_paths`, stat calls per file (2,000 files) | 4.0 | **2.0** |
+| `scan_paths`, wall time on an SSD | 62.3 ms | 62.4 ms — the saving is in the calls, which is what an SD card over USB charges for |
+| Unit tests | 96 | **148** |
+| GUI drive checks | 57 | **83** |
+
+Three places the plan was wrong, and what was done instead:
+
+- **P6 claimed no existing test needed editing.** P4's wiring contradicts
+  `test_a_video_is_reported_without_being_opened` (`test_renamer.py:1009`), which
+  pinned the very skip P4 removes. It was rewritten to pin the new behaviour, with a
+  second test keeping the old promise that a container with nothing in it still falls
+  back to the file date. That is the only existing test this work edited.
+- **P3's panel does not fit.** It asks for 216 px, which at the default window size
+  costs the file list five of its nine rows. It folds away behind a one-line strip,
+  opening it grows the window rather than squeezing the table, and it reopens by
+  itself whenever there are stays to see.
+- **P1's error message example never fires.** `strptime` reads `2026-9-15` correctly,
+  so refusing it would be pedantry; only text with no date in it at all is an error.
+  A related gap the plan left open: an end given to the minute now runs through the
+  end of that minute, so the panel can offer 23:59 as the end of a day without
+  quietly dropping its last 59 seconds.
+
+Two things from the round before still bind anything written here:
 
 - **Anything that changes a `PhotoFile`'s path or date must go through `relocate()`
   or `set_taken_at()`**, never a bare assignment — those refresh the cached
@@ -379,7 +404,7 @@ measurement with no old counterpart.
 
 ## Sequencing
 
-Each commit leaves the suite green on its own.
+Each commit left the suite green on its own. All seven landed in this order.
 
 | # | Commit | Files | Risk |
 |---|---|---|---|
