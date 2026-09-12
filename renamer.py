@@ -7,10 +7,11 @@ without opening a window (see test_renamer.py).
 Reading order if you are learning the code:
     1. PhotoFile / read_taken_at ..... how a file on disk becomes data
     2. Stay / place_for .............. how a capture date becomes a place
-    3. expand_pattern ................ how "{date}_{event}_{n}" becomes text
-    4. apply_cleanup / sanitize_stem . how that text is made Windows/web safe
-    5. plan_renames .................. old name -> new name, for the preview
-    6. apply_renames / undo_last ..... the only two functions that touch disk
+    3. split_pattern / reorder_tokens . how a pattern becomes movable blocks
+    4. expand_pattern ................ how "{date}_{event}_{n}" becomes text
+    5. apply_cleanup / sanitize_stem . how that text is made Windows/web safe
+    6. plan_renames .................. old name -> new name, for the preview
+    7. apply_renames / undo_last ..... the only two functions that touch disk
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ import os
 import re
 import sys
 import unicodedata
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
@@ -573,6 +575,9 @@ def parse_stay(start_text: str, end_text: str, place: str) -> Stay:
 # 2. Patterns and tokens
 # --------------------------------------------------------------------------
 
+# Every {token} in a pattern, as both expand_pattern and split_pattern see it.
+TOKEN_RE = re.compile(r"\{(\w+)\}")
+
 TOKEN_HELP = {
     "{date}": "2026-06-12  (ISO date, sorts chronologically)",
     "{date8}": "20260612  (compact ISO date)",
@@ -597,15 +602,15 @@ def camera_id(stem: str, length: int = 4) -> str:
     return stem[-length:]
 
 
-def expand_pattern(pattern: str, *, photo: PhotoFile, event: str,
-                   index: int, digits: int, place: str = "") -> str:
-    """Replace every {token} in `pattern`. Unknown tokens are left alone
-    so a typo is visible in the preview instead of silently vanishing.
+def _pattern_values(photo: PhotoFile, *, event: str, index: int, digits: int,
+                    place: str) -> dict[str, str]:
+    """What each {token} stands for, for this one photo.
 
-    `place` is already resolved by the caller (see build_new_stem): this
-    function stays a plain substitution and never looks at the stay list.
+    The single definition of every token's text. expand_pattern renders it
+    into a string; expand_with_spans renders it into coloured blocks. Neither
+    gets to disagree with the other about what {date} means.
     """
-    values = {
+    return {
         "date": photo.taken_at.strftime("%Y-%m-%d"),
         "date8": photo.taken_at.strftime("%Y%m%d"),
         "time": photo.taken_at.strftime("%H-%M-%S"),
@@ -617,9 +622,106 @@ def expand_pattern(pattern: str, *, photo: PhotoFile, event: str,
         # cleanup then strips the "__" or trailing "_" it leaves behind.
         "place": place,
     }
-    return re.sub(r"\{(\w+)\}",
-                  lambda m: values.get(m.group(1), m.group(0)),
-                  pattern)
+
+
+def expand_pattern(pattern: str, *, photo: PhotoFile, event: str,
+                   index: int, digits: int, place: str = "") -> str:
+    """Replace every {token} in `pattern`. Unknown tokens are left alone
+    so a typo is visible in the preview instead of silently vanishing.
+
+    `place` is already resolved by the caller (see build_new_stem): this
+    function stays a plain substitution and never looks at the stay list.
+    """
+    values = _pattern_values(photo, event=event, index=index, digits=digits,
+                             place=place)
+    return TOKEN_RE.sub(lambda m: values.get(m.group(1), m.group(0)), pattern)
+
+
+# --------------------------------------------------------------------------
+# 2b. A pattern as movable blocks
+#
+# The window draws the pattern as chips you can drag into a new order. All the
+# dragging needs from here is: cut the text into pieces, and put the pieces
+# back in a different order. Nothing below knows a window exists, so the whole
+# reordering rule is unit-testable without one.
+# --------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Segment:
+    """One piece of a pattern: a {token}, or the literal glue around it.
+
+    `token` is the bare name ("date"), or None for glue — the "_" between two
+    tokens, or a literal like the "IMG" in "IMG_{date}".
+    """
+
+    text: str
+    token: str | None = None
+
+    @property
+    def is_token(self) -> bool:
+        return self.token is not None
+
+
+def split_pattern(pattern: str) -> list[Segment]:
+    """Cut "{date}_{n}" into [{date}, _, {n}].
+
+    Lossless on purpose: every character of `pattern` lands in exactly one
+    segment, so joining the pieces back up returns the original string. That
+    is what lets the strip be a view of the pattern box rather than a second,
+    drifting copy of it.
+    """
+    segments: list[Segment] = []
+    cursor = 0
+    for match in TOKEN_RE.finditer(pattern):
+        if match.start() > cursor:
+            segments.append(Segment(pattern[cursor:match.start()]))
+        segments.append(Segment(match.group(0), match.group(1)))
+        cursor = match.end()
+    if cursor < len(pattern):
+        segments.append(Segment(pattern[cursor:]))
+    return segments
+
+
+def token_order(pattern: str) -> list[str]:
+    """Just the token names, in the order they appear."""
+    return [s.token for s in split_pattern(pattern) if s.token is not None]
+
+
+def reorder_tokens(pattern: str, order: Sequence[int]) -> str:
+    """Rewrite `pattern` with its tokens permuted by `order`.
+
+    `order` lists the old positions in their new sequence, so (1, 2, 0) turns
+    "{date}_{event}_{n}" into "{event}_{n}_{date}".
+
+    Only the tokens move. The glue stays exactly where it is — the separators
+    are slots, not luggage — which is what makes a drag land where you expect
+    instead of shuffling the underscores about with it. "IMG_{date}_{n}" keeps
+    its IMG_ prefix no matter what you do to date and n.
+
+    A malformed `order` (wrong length, repeats, out of range) returns the
+    pattern untouched rather than raising: this is driven by a mouse, and a
+    fumbled drop is never worth an exception.
+    """
+    segments = split_pattern(pattern)
+    slots = [i for i, segment in enumerate(segments) if segment.is_token]
+    order = list(order)
+    if sorted(order) != list(range(len(slots))):
+        return pattern
+    moved = [segments[slots[old]] for old in order]
+    out = list(segments)
+    for slot, segment in zip(slots, moved):
+        out[slot] = segment
+    return "".join(segment.text for segment in out)
+
+
+def move_token(pattern: str, frm: int, to: int) -> str:
+    """Pull the token at position `frm` out and drop it in at position `to`."""
+    count = len(token_order(pattern))
+    if not (0 <= frm < count and 0 <= to < count):
+        return pattern
+    order = list(range(count))
+    order.insert(to, order.pop(frm))
+    return reorder_tokens(pattern, order)
 
 
 # --------------------------------------------------------------------------
@@ -806,6 +908,120 @@ def build_new_stem(photo: PhotoFile, settings: RenameSettings, index: int) -> st
                           photo.stem, flags=re.IGNORECASE)
 
     return sanitize_stem(stem)
+
+
+# A character of the finished name, and the token it came from (None = glue).
+TaggedChar = tuple[str, "str | None"]
+
+
+def _collapse_tagged(tagged: list[TaggedChar], matches, replacement: str
+                     ) -> list[TaggedChar]:
+    """Squash each run of matching characters down to one `replacement`.
+
+    The tagged twin of re.sub(r"-{2,}", "-", text): the surviving character
+    keeps the tag of the first one in the run, so a separator that two tokens
+    fought over is credited to the one on the left.
+    """
+    out: list[TaggedChar] = []
+    run = False
+    for ch, tag in tagged:
+        if matches(ch):
+            if not run:
+                out.append((replacement, tag))
+            run = True
+        else:
+            out.append((ch, tag))
+            run = False
+    return out
+
+
+def _cleanup_tagged(tagged: list[TaggedChar], opts: CleanupOptions
+                    ) -> list[TaggedChar]:
+    """apply_cleanup, step for step, over tagged characters instead of a string."""
+    out = tagged
+    if opts.strip_accents:
+        out = [(part, tag) for ch, tag in out
+               for part in unicodedata.normalize("NFKD", ch)
+               if not unicodedata.combining(part)]
+    if opts.spaces_to_hyphens:
+        out = _collapse_tagged(out, str.isspace, "-")
+    if opts.lowercase:
+        out = [(part, tag) for ch, tag in out for part in ch.lower()]
+    if opts.collapse_separators:
+        out = _collapse_tagged(out, lambda ch: ch == "-", "-")
+        out = _collapse_tagged(out, lambda ch: ch == "_", "_")
+        while out and out[0][0] in "-_":
+            out.pop(0)
+        while out and out[-1][0] in "-_":
+            out.pop()
+    return out
+
+
+def _sanitize_tagged(tagged: list[TaggedChar]) -> list[TaggedChar]:
+    """sanitize_stem, over tagged characters. Anything it invents is glue."""
+    out = [(ch, tag) for ch, tag in tagged
+           if ch not in ILLEGAL_CHARS and ord(ch) >= 32]
+    while out and out[-1][0] in " .":
+        out.pop()
+    stem = "".join(ch for ch, _ in out)
+    if stem.upper().split(".")[0] in RESERVED_NAMES:
+        out.insert(0, ("_", None))
+    elif not stem:
+        out = [(ch, None) for ch in "unnamed"]
+    return out
+
+
+def expand_with_spans(photo: PhotoFile, settings: RenameSettings, index: int
+                      ) -> tuple[str, list[tuple[str, int, int]]]:
+    """build_new_stem's answer, plus which token every character came from.
+
+    Returns (stem, spans), where spans is [(token, start, end), ...] pointing
+    into that stem — enough for the window to paint {date}'s characters one
+    colour and {event}'s another, so the example line and the blocks above it
+    are visibly the same thing.
+
+    Why it has to work this hard: cleanup runs *after* expansion, and each of
+    its steps moves characters about — "Lakeside Wedding" becomes
+    "lakeside-wedding" — so offsets taken before cleanup would point at the
+    wrong letters afterwards. This carries a token name beside every character
+    through the very same steps instead.
+
+    It is deliberately the slow way round, and that is fine: it runs once, for
+    the one example line, not once per ticked file. build_new_stem's hot path
+    is untouched. TestSpansMatchTheRealName checks the two never disagree, and
+    a caller that finds they do is expected to drop the colours rather than
+    show a name the rename would not actually produce.
+
+    Only New name mode builds a name out of tokens, so the other two modes get
+    their real stem back with no spans at all.
+    """
+    if settings.mode is not Mode.NEW_NAME:
+        return build_new_stem(photo, settings, index), []
+
+    values = _pattern_values(photo, event=settings.event, index=index,
+                             digits=settings.digits,
+                             place=place_for(photo.taken_at, settings.stays))
+    tagged: list[TaggedChar] = []
+    for segment in split_pattern(settings.pattern):
+        if segment.token in values:
+            tagged += [(ch, segment.token) for ch in values[segment.token]]
+        else:
+            # Glue, or an unknown token — expand_pattern leaves a typo like
+            # {dat} standing so you can see it, and so does this.
+            tagged += [(ch, None) for ch in segment.text]
+
+    tagged = _sanitize_tagged(_cleanup_tagged(tagged, settings.cleanup))
+
+    spans: list[tuple[str, int, int]] = []
+    for position, (_ch, tag) in enumerate(tagged):
+        if tag is None:
+            continue
+        if spans and spans[-1][0] == tag and spans[-1][2] == position:
+            token, start, _end = spans[-1]
+            spans[-1] = (token, start, position + 1)
+        else:
+            spans.append((tag, position, position + 1))
+    return "".join(ch for ch, _ in tagged), spans
 
 
 @dataclass

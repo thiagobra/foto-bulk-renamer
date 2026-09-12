@@ -37,7 +37,7 @@ every new name before anything touches disk and a one-click undo.
 | `renamer.py` | **Pure core.** Scanning, EXIF dates, pattern expansion, collision planning, the two-phase rename, the undo log. Imports no `tkinter` — keep it that way. |
 | `app.py` | The Tk window. A shell over `renamer.py`; it should hold no naming logic. |
 | `presets.py` | Naming presets as plain frozen dataclasses. Adding one is a two-line edit. |
-| `test_renamer.py` | 138 unit tests over the core, no window needed. |
+| `test_renamer.py` | 164 unit tests over the core, no window needed. |
 | `tools/gui_smoke.py`, `tools/gui_drive_full.py` | Headless GUI drives. CI runs the first one. |
 | `tools/bench.py` | Times the live preview against the old approach. Not a test; CI ignores it. |
 
@@ -45,10 +45,16 @@ every new name before anything touches disk and a one-click undo.
 
 - **The core stays GUI-free.** Anything that can be tested without a window belongs in
   `renamer.py`.
-- **Never break the existing tests to make a change fit.** All 148 must stay green; if a
+- **Never break the existing tests to make a change fit.** All 174 must stay green; if a
   change needs a test edited, say so explicitly rather than quietly rewriting it.
 - **The GUI's design and layout are settled.** Do not restyle, re-lay-out or "improve" the
   interface unless asked. Internal wiring changes are fine.
+- **`expand_with_spans` must never disagree with `build_new_stem`.** It is a
+  second, slower path through expansion and cleanup that carries a token name
+  beside every character, so the window can colour the example line. If the two
+  ever produce different text the window drops the colours — but the real fix
+  is in `renamer.py`: `TestSpansMatchTheRealName` is what catches it, and a new
+  cleanup step has to be taught to `_cleanup_tagged` as well as `apply_cleanup`.
 - **Nothing touches disk outside `apply_renames`/`undo_last`.** Planning must stay a pure
   function of (files, settings) so the live preview can run on every keystroke.
 - Run `python -m unittest discover -v -p "test_*.py"` before committing.
@@ -72,7 +78,23 @@ every new name before anything touches disk and a one-click undo.
 capture-date fixes it depended on, and the scandir rewrite of the scan. Its measured
 outcomes are recorded in the file itself. Nothing in it is outstanding.
 
-Four things that round left behind, on top of the two below:
+Since then, the **token strip**: the pattern drawn as blocks you drag into a
+new order, with the example line coloured to match. Three things it left
+behind:
+
+- **The pattern string is the only source of truth for order.** A drag calls
+  `renamer.move_token` and sets `var_pattern`; the strip then redraws itself
+  from that text. There is no second copy of the order anywhere, which is what
+  stops the strip and the pattern box drifting apart.
+- **`reorder_tokens` moves tokens, never glue.** The separators are slots. This
+  is the whole reason a drag lands where you expect, and it is why
+  `IMG_{date}_{n}` keeps its prefix.
+- **The Place panel's Position dropdown is now a readout**, recomputed from the
+  pattern in `_sync_place_position` on every preview. It gained a `Custom`
+  value for arrangements it has no word for. Do not set it from the drag
+  handlers — one place, off the pattern, or it starts lying.
+
+Four things the plan's own round left behind, on top of the two below:
 
 - **A photo's date now comes from a chain, not one tag**: `DateTimeOriginal`,
   `CreateDate`, `ModifyDate` for images, and the container's own boxes for videos.

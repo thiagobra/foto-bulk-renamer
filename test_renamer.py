@@ -336,6 +336,191 @@ class TestPlaceResolution(unittest.TestCase):
             renamer.place_for(datetime(2026, 9, 15, 12), (second, first)), "Park")
 
 
+class TestPatternBlocks(unittest.TestCase):
+    """A pattern cut into movable pieces, and put back in another order.
+
+    This is everything the drag strip in the window needs. The window itself
+    only turns a mouse into two numbers and hands them to move_token.
+    """
+
+    def test_splitting_is_lossless(self):
+        for pattern in ("{date}_{event}_{n}", "IMG_{date8}", "", "plain text",
+                        "{a}{b}", "_{n}_", "{nope}-{n}"):
+            with self.subTest(pattern=pattern):
+                pieces = renamer.split_pattern(pattern)
+                self.assertEqual("".join(s.text for s in pieces), pattern)
+
+    def test_tokens_and_glue_are_told_apart(self):
+        pieces = renamer.split_pattern("IMG_{date}_{n}")
+        self.assertEqual([(s.text, s.token) for s in pieces],
+                         [("IMG_", None), ("{date}", "date"),
+                          ("_", None), ("{n}", "n")])
+
+    def test_an_empty_pattern_has_no_pieces(self):
+        self.assertEqual(renamer.split_pattern(""), [])
+
+    def test_a_pattern_with_no_tokens_is_one_piece_of_glue(self):
+        pieces = renamer.split_pattern("holiday")
+        self.assertEqual(len(pieces), 1)
+        self.assertFalse(pieces[0].is_token)
+
+    def test_token_order_names_them_in_order(self):
+        self.assertEqual(renamer.token_order("{date}_{event}_{n}"),
+                         ["date", "event", "n"])
+
+    def test_reordering_moves_tokens_and_leaves_the_glue(self):
+        self.assertEqual(renamer.reorder_tokens("{date}_{event}_{n}", (1, 2, 0)),
+                         "{event}_{n}_{date}")
+
+    def test_the_separators_keep_their_own_shapes(self):
+        # The "-" stays the first separator and the "_" stays the second,
+        # whatever passes through them.
+        self.assertEqual(renamer.reorder_tokens("{date}-{event}_{n}", (2, 1, 0)),
+                         "{n}-{event}_{date}")
+
+    def test_a_literal_prefix_is_pinned(self):
+        self.assertEqual(renamer.reorder_tokens("IMG_{date}_{n}", (1, 0)),
+                         "IMG_{n}_{date}")
+
+    def test_the_identity_order_changes_nothing(self):
+        self.assertEqual(renamer.reorder_tokens("{date}_{n}", (0, 1)),
+                         "{date}_{n}")
+
+    def test_a_nonsense_order_is_ignored_rather_than_raising(self):
+        # It is driven by a mouse. A fumbled drop is not worth an exception.
+        for order in ((0,), (0, 0), (0, 5), (), (-1, 0)):
+            with self.subTest(order=order):
+                self.assertEqual(renamer.reorder_tokens("{date}_{n}", order),
+                                 "{date}_{n}")
+
+    def test_moving_a_token_to_the_end(self):
+        self.assertEqual(renamer.move_token("{date}_{event}_{n}", 0, 2),
+                         "{event}_{n}_{date}")
+
+    def test_moving_a_token_to_the_front(self):
+        self.assertEqual(renamer.move_token("{date}_{event}_{n}", 2, 0),
+                         "{n}_{date}_{event}")
+
+    def test_moving_a_token_into_the_middle(self):
+        self.assertEqual(renamer.move_token("{date}_{event}_{n}", 2, 1),
+                         "{date}_{n}_{event}")
+
+    def test_moving_and_moving_back_returns_the_original(self):
+        pattern = "{date}_{event}_{n}_{cam}"
+        there = renamer.move_token(pattern, 0, 3)
+        self.assertEqual(renamer.move_token(there, 3, 0), pattern)
+
+    def test_an_out_of_range_move_is_a_no_op(self):
+        self.assertEqual(renamer.move_token("{date}_{n}", 0, 7), "{date}_{n}")
+        self.assertEqual(renamer.move_token("{date}_{n}", -1, 0), "{date}_{n}")
+
+    def test_moving_a_pattern_with_nothing_in_it_is_a_no_op(self):
+        self.assertEqual(renamer.move_token("holiday", 0, 0), "holiday")
+
+
+class TestSpansMatchTheRealName(unittest.TestCase):
+    """expand_with_spans has to agree with build_new_stem, character for
+    character, or the window would colour a name the rename never produces."""
+
+    def setUp(self):
+        self.photo = make_photo("IMG_20260612_142233")
+
+    def settings(self, pattern, **kw):
+        kw.setdefault("event", "lakeside wedding")
+        return RenameSettings(pattern=pattern, digits=3, **kw)
+
+    def test_it_agrees_with_build_new_stem_everywhere(self):
+        """The guarantee the whole feature rests on, over 1500-odd cases."""
+        patterns = ["{date}_{event}_{n}", "{event}-{n}", "IMG_{date8}_{cam}",
+                    "{orig}_{event}", "{place}_{date}_{event}_{n}", "{date}",
+                    "{dat}_{n}", "", "___{event}___", "{place}", "CON",
+                    "{time}_{place}_{n}"]
+        events = ["", "Lakeside Wedding", "café  Déjà vu", "a/b:c*d", "   "]
+        stays = (renamer.Stay(datetime(2026, 6, 1), datetime(2026, 6, 30),
+                              "New York City"),)
+        for pattern in patterns:
+            for event in events:
+                for flags in ((True,) * 4, (False,) * 4,
+                              (True, False, True, False),
+                              (False, True, False, True)):
+                    for trip in ((), stays):
+                        settings = self.settings(
+                            pattern, event=event, stays=trip,
+                            cleanup=CleanupOptions(*flags))
+                        with self.subTest(pattern=pattern, event=event,
+                                          flags=flags, stays=bool(trip)):
+                            stem, _spans = renamer.expand_with_spans(
+                                self.photo, settings, 14)
+                            self.assertEqual(
+                                stem,
+                                renamer.build_new_stem(self.photo, settings, 14))
+
+    def test_the_spans_point_at_the_right_characters(self):
+        stem, spans = renamer.expand_with_spans(
+            self.photo, self.settings("{date}_{event}_{n}"), 14)
+        self.assertEqual(stem, "2026-06-12_lakeside-wedding_014")
+        self.assertEqual([(t, stem[a:b]) for t, a, b in spans],
+                         [("date", "2026-06-12"), ("event", "lakeside-wedding"),
+                          ("n", "014")])
+
+    def test_a_span_survives_spaces_becoming_hyphens(self):
+        # The hyphen inside a token belongs to that token, even though it was
+        # a space when the token was expanded.
+        stem, spans = renamer.expand_with_spans(
+            self.photo, self.settings("{event}", event="lake  side"), 1)
+        self.assertEqual(stem, "lake-side")
+        self.assertEqual(spans, [("event", 0, 9)])
+
+    def test_a_span_survives_accents_being_stripped(self):
+        stem, spans = renamer.expand_with_spans(
+            self.photo, self.settings("{event}", event="café"), 1)
+        self.assertEqual(stem, "cafe")
+        self.assertEqual(spans, [("event", 0, 4)])
+
+    def test_an_empty_place_contributes_no_span(self):
+        stem, spans = renamer.expand_with_spans(
+            self.photo, self.settings("{date}_{place}_{n}"), 14)
+        self.assertEqual(stem, "2026-06-12_014")
+        self.assertEqual([t for t, _a, _b in spans], ["date", "n"])
+
+    def test_glue_belongs_to_nobody(self):
+        stem, spans = renamer.expand_with_spans(
+            self.photo, self.settings("IMG_{n}"), 14)
+        self.assertEqual(stem, "img_014")
+        self.assertEqual(spans, [("n", 4, 7)])
+
+    def test_an_unknown_token_is_shown_but_not_coloured(self):
+        stem, spans = renamer.expand_with_spans(
+            self.photo, self.settings("{nope}_{n}"), 14)
+        self.assertEqual(stem, "{nope}_014")
+        self.assertEqual(spans, [("n", 7, 10)])
+
+    def test_spans_are_in_order_and_never_overlap(self):
+        _stem, spans = renamer.expand_with_spans(
+            self.photo, self.settings("{date}_{time}_{event}_{n}_{cam}"), 14)
+        edges = [0]
+        for _token, start, end in spans:
+            self.assertLessEqual(edges[-1], start)
+            self.assertLess(start, end)
+            edges.append(end)
+
+    def test_reordering_the_pattern_reorders_the_spans(self):
+        moved = self.settings(renamer.move_token("{date}_{event}_{n}", 0, 2))
+        stem, spans = renamer.expand_with_spans(self.photo, moved, 14)
+        self.assertEqual(stem, "lakeside-wedding_014_2026-06-12")
+        self.assertEqual([t for t, _a, _b in spans], ["event", "n", "date"])
+
+    def test_the_other_two_modes_get_a_name_and_no_colours(self):
+        for mode in (Mode.INSERT, Mode.REPLACE):
+            with self.subTest(mode=mode):
+                settings = RenameSettings(mode=mode, insert_text="trip",
+                                          find="IMG", replace_with="pic")
+                stem, spans = renamer.expand_with_spans(self.photo, settings, 1)
+                self.assertEqual(spans, [])
+                self.assertEqual(
+                    stem, renamer.build_new_stem(self.photo, settings, 1))
+
+
 class TestCleanupAndSafety(unittest.TestCase):
 
     def test_accents_spaces_case(self):

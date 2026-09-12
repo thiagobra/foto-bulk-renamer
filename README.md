@@ -73,6 +73,31 @@ text you type* — the rest of the original name is left exactly as it was. In
 | `{n}` | `014` — sequence number, zero-padded to the Digits box |
 | `{place}` | `new-york-city` — where you were, from the trip list (see below). Empty for a photo outside every trip, and the separator it would have left is tidied away |
 
+### Putting the tokens in the order you want
+
+Next to the pattern box the pattern is also drawn as blocks — `date _ event _
+n` — and **you can drag them into any order you like**. Drop `date` on the end
+and the pattern box, the preview and every name in the list follow
+immediately. The tokens you are not using sit greyed out after a `+`; click one
+to put it on the end, then drag it where it belongs.
+
+The example line above the blocks shows the first ticked photo's finished name
+with **each part in its block's colour**, so you can see at a glance which
+block put which characters in the name:
+
+<p align="center">
+  <img src="screenshots/09-dragging-a-token.png" width="820"
+       alt="Dragging the date block to the end of the pattern"></p>
+
+Two things worth knowing:
+
+* Only the tokens move. The separators are slots, not luggage, so
+  `{date}-{event}_{n}` keeps its hyphen first and its underscore second
+  whatever you drag through them, and a literal prefix like the `IMG` in
+  `IMG_{date}_{n}` stays put.
+* Dragging edits the pattern, so the preset switches itself to **Custom…** —
+  but it leaves your four Clean up switches exactly as you set them.
+
 ### Naming photos after where you were
 
 Open **Place** under the pattern box and declare the trip once — "15 Sep I was
@@ -84,7 +109,7 @@ city.
 |---|---|
 | **City** | Type it once; it joins the dropdown for next time. |
 | **From / To** | `YYYY-MM-DD`, plus an optional `HH:MM`. A date on its own means the whole day. An end time runs through the end of that minute, so `18:00` includes the shot at 18:00:30. |
-| **Position** | Where `{place}` goes: `Beginning`, `After the date`, `End (suffix)`, or `Off`. It rewrites the pattern box, so you can always see where the place went. |
+| **Position** | Where `{place}` goes: `Beginning`, `After the date`, `End (suffix)`, or `Off`. It rewrites the pattern box, so you can always see where the place went — and it reads back the other way too, following the block when you drag it. Dragging it somewhere none of those three describe reads as `Custom`. |
 
 Trips may overlap, and **the narrowest one wins**: declare the week in Boston
 *and* the afternoon at Fenway Park, and the photos from that afternoon are the
@@ -202,10 +227,10 @@ thumbnailed — decoding raw needs a much heavier dependency than this app wants
 | `app.py` | The window — layout, theme, drag & drop, live preview. |
 | `renamer.py` | All the naming rules. No GUI code, so it can be tested on its own. |
 | `presets.py` | The preset table as plain data — add your own in two lines. |
-| `test_renamer.py` | 138 tests for the naming and disk rules. No window needed. |
+| `test_renamer.py` | 164 tests for the naming and disk rules. No window needed. |
 | `test_packaging.py` | 10 tests for the Windows-only files (CRLF, batch syntax, build flags). |
 | `tools/gui_smoke.py` | Opens the real window and drives it. What CI runs. |
-| `tools/gui_drive_full.py` | The long manual GUI sweep (83 checks) and the screenshot generator. |
+| `tools/gui_drive_full.py` | The long manual GUI sweep (109 checks) and the screenshot generator. |
 | `tools/bench.py` | Times the live preview, old approach against current. Not run by CI. |
 | `make_icon.py` | Regenerates `assets/icon.ico`. |
 | `run.bat` / `build_exe.bat` | Run from source / build the standalone exe. |
@@ -215,7 +240,7 @@ thumbnailed — decoding raw needs a much heavier dependency than this app wants
 ### Running the tests
 
 ```
-python -m unittest discover -v -p "test_*.py"     # 148 tests, no display needed
+python -m unittest discover -v -p "test_*.py"     # 174 tests, no display needed
 xvfb-run -a python tools/gui_smoke.py             # drives the real window (Linux)
 python tools\gui_smoke.py                         # the same, on Windows
 ```
@@ -253,6 +278,6 @@ was cleared.
 
 | | Where | Status |
 |---|---|---|
-| Logic — 148 unit tests | Windows **and** Linux, Python 3.10 and 3.12 | ✅ green on every push (CI). This includes the rules that only behave like Windows *on* Windows: the 260-character path cap, reserved names (`CON`, `NUL`), and case-only renames such as `IMG_0001.JPG` → `img_0001.jpg`. |
+| Logic — 174 unit tests | Windows **and** Linux, Python 3.10 and 3.12 | ✅ green on every push (CI). This includes the rules that only behave like Windows *on* Windows: the 260-character path cap, reserved names (`CON`, `NUL`), and case-only renames such as `IMG_0001.JPG` → `img_0001.jpg`. |
 | The real window | Linux, headless | ✅ green on every push (CI), plus an 83-check manual sweep via `tools/gui_drive_full.py` |
 | Windows **desktop** behaviour | a real Windows PC | ⚠️ **Not verified.** DPI awareness, the dark title bar, double-clicking `run.bat`, and the PyInstaller `.exe` cannot be exercised by a CI runner with no desktop session. They are reviewed against the Windows API docs and asserted where a file can be asserted (`test_packaging.py` checks the batch files' CRLF endings, block syntax and build flags), but nobody has yet double-clicked `run.bat` on Windows. That is the one remaining gap. |

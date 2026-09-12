@@ -6,7 +6,7 @@ long one you run by hand before a release, because it needs a display and
 takes longer. Nothing here is mocked: a real Tk window is created, real
 widgets are invoked, and the assertions look at the actual files on disk.
 
-    xvfb-run -a python tools/gui_drive_full.py all      # 57 checks
+    xvfb-run -a python tools/gui_drive_full.py all      # 109 checks
     xvfb-run -a python tools/gui_drive_full.py shots screenshots
 """
 import os, sys, json, shutil, subprocess, tempfile, traceback
@@ -493,6 +493,158 @@ def sc_place_panel():
           "{place}" in b.var_pattern.get(), b.var_pattern.get())
     b.root.destroy()
 
+def drag_block(a, index, dx):
+    """Press a token block, slide `dx` pixels sideways, drop it.
+
+    Real <ButtonPress-1>/<B1-Motion>/<ButtonRelease-1> events on the real
+    widget, so this exercises the same code path a mouse does. Returns whether
+    the drop caret showed itself while the button was down.
+    """
+    block = a.token_blocks[index]
+    block.event_generate("<ButtonPress-1>", x=5, y=5)
+    pump(a.root, 2)
+    block.event_generate("<B1-Motion>", x=5 + dx, y=5)
+    pump(a.root, 2)
+    caret = bool(a.drop_caret.winfo_ismapped())
+    block.event_generate("<ButtonRelease-1>", x=5 + dx, y=5)
+    pump(a.root, 8)
+    return caret
+
+
+def coloured(a):
+    """[(token, the characters it painted), ...] from the example line."""
+    text = a.text_example
+    out = []
+    for token in gui.TOKEN_COLORS:
+        ranges = text.tag_ranges(token)
+        for i in range(0, len(ranges), 2):
+            out.append((token, str(text.get(ranges[i], ranges[i + 1])),
+                        int(str(ranges[i]).split(".")[1])))
+    return [(t, s) for t, s, _start in sorted(out, key=lambda r: r[2])]
+
+
+def sc_token_strip():
+    """Dragging the {date}/{event}/{n}/{place} blocks into a new order."""
+    wipe_settings()
+    print("\n[12] the token strip: drag a block, the name follows")
+    fresh_fixtures()
+    import presets as pm
+    a = new_app()
+    a.add_paths([str(FIX / "cardA")])
+    a.wait_for_dates()
+    a.var_event.set("lakeside wedding")
+    pump(a.root, 10)
+
+    check("the strip draws one block per token in the pattern",
+          [b.cget("text") for b in a.token_blocks] == ["date", "event", "n"],
+          [b.cget("text") for b in a.token_blocks])
+    check("the tokens you are not using are offered as spares",
+          [b.cget("text") for b in a.chip_buttons] ==
+          ["date8", "time", "orig", "cam", "place"],
+          [b.cget("text") for b in a.chip_buttons])
+    check("the example line is coloured token by token",
+          coloured(a) == [("date", "2026-06-12"),
+                          ("event", "lakeside-wedding"), ("n", "001")],
+          coloured(a))
+
+    before = a.plans[0].new_name
+    a.var_lower.set(False)          # a switch the drag must not touch
+    pump(a.root, 6)
+    lower_off = a.plans[0].new_name
+
+    # Drag {date} past the far end of the strip.
+    reach = a.token_blocks[-1].winfo_x() + a.token_blocks[-1].winfo_width() + 40
+    caret = drag_block(a, 0, reach)
+    check("the drop caret shows where the block would land", caret)
+    check("the caret is put away again after the drop",
+          not a.drop_caret.winfo_ismapped())
+    check("dragging a block rewrites the pattern",
+          a.var_pattern.get() == "{event}_{n}_{date}", a.var_pattern.get())
+    check("the blocks redraw in the new order",
+          [b.cget("text") for b in a.token_blocks] == ["event", "n", "date"],
+          [b.cget("text") for b in a.token_blocks])
+    check("the preview follows the drag",
+          a.plans[0].new_name == "lakeside-wedding_001_2026-06-12.jpg",
+          a.plans[0].new_name)
+    check("the colours move with the blocks",
+          [t for t, _s in coloured(a)] == ["event", "n", "date"], coloured(a))
+    check("editing the pattern switches the preset to Custom",
+          a.var_preset.get() == pm.PRESETS_BY_KEY["custom"].label,
+          a.var_preset.get())
+    check("...without quietly resetting the cleanup switches",
+          a.var_lower.get() is False)
+
+    # Drag it back to the front.
+    drag_block(a, 2, -(a.token_blocks[2].winfo_x() + 40))
+    check("dragging it back restores the original order",
+          a.var_pattern.get() == "{date}_{event}_{n}", a.var_pattern.get())
+    a.var_lower.set(True)
+    pump(a.root, 6)
+    check("...and the original name with it",
+          a.plans[0].new_name == before, (a.plans[0].new_name, before))
+
+    caret = drag_block(a, 1, 4)
+    check("a block dropped where it started changes nothing",
+          a.var_pattern.get() == "{date}_{event}_{n}", a.var_pattern.get())
+
+    # The spares: click one, it lands on the end, then it can be dragged.
+    a._add_token("cam"); pump(a.root, 8)
+    check("clicking a spare puts it on the end",
+          a.var_pattern.get() == "{date}_{event}_{n}_{cam}", a.var_pattern.get())
+    check("the spare is no longer offered once it is in use",
+          "cam" not in [b.cget("text") for b in a.chip_buttons],
+          [b.cget("text") for b in a.chip_buttons])
+
+    # {place} and the Position dropdown, which now follows the drag.
+    a.var_city.set("Porto")
+    a.var_from_date.set("2026-06-01"); a.var_to_date.set("2026-06-30")
+    a._add_stay(); pump(a.root, 8)
+    check("adding a trip puts {place} on the pattern",
+          "{place}" in a.var_pattern.get(), a.var_pattern.get())
+    check("the Position dropdown says where it went",
+          a.var_place_at.get() == "End (suffix)", a.var_place_at.get())
+
+    place_at = renamer.token_order(a.var_pattern.get()).index("place")
+    drag_block(a, place_at, -(a.token_blocks[place_at].winfo_x() + 40))
+    check("dragging {place} to the front moves it",
+          renamer.token_order(a.var_pattern.get())[0] == "place",
+          a.var_pattern.get())
+    check("the Position dropdown follows the drag",
+          a.var_place_at.get() == "Beginning", a.var_place_at.get())
+
+    # Past two blocks, so it sits after {event}: not first, not last, and not
+    # after the date either — the one arrangement no dropdown entry describes.
+    drag_block(a, 0, a.token_blocks[2].winfo_x() +
+               a.token_blocks[2].winfo_width() + 4)
+    check("dropping it somewhere the dropdown has no word for reads Custom",
+          a.var_place_at.get() == gui.PLACE_CUSTOM, a.var_place_at.get())
+    check("...and the token really is where it was dropped",
+          renamer.token_order(a.var_pattern.get())[2] == "place",
+          a.var_pattern.get())
+
+    # What is previewed is what lands on disk.
+    a.var_pattern.set("{event}_{n}_{date}"); pump(a.root, 10)
+    expected = sorted(p.new_name for p in a.plans)
+    a.do_rename(); pump(a.root, 10)
+    expected = sorted(expected + ["notes.txt"])   # never a photo, never touched
+    check("the reordered name is what actually lands on disk",
+          names(FIX / "cardA") == expected, (names(FIX / "cardA"), expected))
+    a.do_undo(); pump(a.root, 10)
+
+    # And it survives a restart.
+    a.var_pattern.set("{n}_{event}_{date}"); pump(a.root, 10)
+    check("taking {place} out by hand turns the Position dropdown off",
+          a.var_place_at.get() == gui.PLACE_OFF, a.var_place_at.get())
+    a._save_settings(); a.root.destroy()
+    b = new_app()
+    check("the order you dragged into survives a restart",
+          b.var_pattern.get() == "{n}_{event}_{date}", b.var_pattern.get())
+    check("...and the strip comes back drawn in that order",
+          [x.cget("text") for x in b.token_blocks] == ["n", "event", "date"],
+          [x.cget("text") for x in b.token_blocks])
+    b.root.destroy()
+
+
 def sc_screenshots(outdir):
     wipe_settings()
     print("\n[10] regenerating screenshots")
@@ -560,6 +712,25 @@ def sc_screenshots(outdir):
     for _ in range(40): pump(b.root); b._poll_thumbnails()
     shot(b.root, outdir / "08-place-panel.png")
     b.root.destroy()
+
+    # The strip mid-drag: {date} lifted, the caret showing where it will land.
+    # Taken with the mouse button still down, which is the only moment the
+    # feature is visible in a still picture.
+    wipe_settings()
+    c = new_app()
+    c.root.geometry("1200x950+0+0")
+    c.add_paths([str(FIX / "cardA")])
+    c.wait_for_dates()
+    c.var_event.set("lakeside wedding")
+    c.tree.selection_set("0"); c._show_thumbnail()
+    for _ in range(40): pump(c.root); c._poll_thumbnails()
+    block = c.token_blocks[0]
+    reach = c.token_blocks[-1].winfo_x() + c.token_blocks[-1].winfo_width() + 30
+    block.event_generate("<ButtonPress-1>", x=5, y=5); pump(c.root, 2)
+    block.event_generate("<B1-Motion>", x=5 + reach, y=5); pump(c.root, 4)
+    shot(c.root, outdir / "09-dragging-a-token.png")
+    block.event_generate("<ButtonRelease-1>", x=5 + reach, y=5); pump(c.root, 8)
+    c.root.destroy()
     print("   ", sorted(p.name for p in outdir.glob("*.png")))
 
 # ---------------------------------------------------------------------------
@@ -570,7 +741,7 @@ if __name__ == "__main__":
     todo = [sc_presets_and_modes, sc_rename_undo_restart, sc_multifolder,
             sc_deleted_midbatch, sc_locked_file, sc_thumbnail_and_selection,
             sc_settings_persist, sc_long_name, sc_heic, sc_metadata_dates,
-            sc_place_panel]
+            sc_place_panel, sc_token_strip]
     if only == "shots":
         sc_screenshots(out)
     else:

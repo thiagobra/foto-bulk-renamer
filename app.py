@@ -57,6 +57,21 @@ GREEN = "#6ccb5f"
 AMBER = "#f2c14e"
 RED = "#ff8a8a"
 
+# One colour per token, shared by the draggable blocks and the example line
+# underneath them. Seeing "2026-06-12" in the same blue as the [date] block is
+# the whole point: it says which block put which characters in the name.
+TOKEN_COLORS = {
+    "date": ACCENT, "date8": ACCENT,
+    "time": "#7fd8c9",
+    "event": GREEN,
+    "place": "#ffa96b",
+    "n": AMBER,
+    "orig": "#c9a0ff",
+    "cam": "#ff8ab8",
+}
+BLOCK_BG = "#2f2f2f"
+BLOCK_BG_HELD = "#454545"
+
 THUMB_SIZE = (232, 174)
 
 INSERT_LABELS = {
@@ -71,7 +86,11 @@ INSERT_LABEL_BY_VALUE = {v: k for k, v in INSERT_LABELS.items()}
 # text rather than switching on a placement mode, so the pattern box stays the
 # one source of truth and you can see where the place went.
 PLACE_OFF = "Off"
-PLACE_POSITIONS = (PLACE_OFF, "Beginning", "After the date", "End (suffix)")
+# What the dropdown reads once {place} has been dragged somewhere none of the
+# other three describe. Choosing it by hand does nothing — it is a readout.
+PLACE_CUSTOM = "Custom"
+PLACE_POSITIONS = (PLACE_OFF, "Beginning", "After the date", "End (suffix)",
+                   PLACE_CUSTOM)
 
 
 # --------------------------------------------------------------------------
@@ -692,8 +711,20 @@ class FotoRenamer:
         self.combo_preset.grid(row=0, column=1, sticky="ew", pady=(0, 7))
         self.combo_preset.bind("<<ComboboxSelected>>",
                                lambda _e: self._on_preset_change())
-        ttk.Label(panel, textvariable=self.var_example, style="Mono.TLabel").grid(
-            row=0, column=2, sticky="w", padx=(18, 0), pady=(0, 7))
+        # A Text, not a Label, because a Label can only be one colour and this
+        # line has to be several: each token's characters in that token's own
+        # colour. It is read-only — state="disabled" — so it still behaves
+        # like the label it replaced.
+        self.text_example = tk.Text(panel, height=1, width=44, relief="flat",
+                                    highlightthickness=0, borderwidth=0,
+                                    background=BG, foreground=MUTED,
+                                    font=(self.mono, 10), cursor="arrow",
+                                    wrap="none", takefocus=0)
+        self.text_example.grid(row=0, column=2, sticky="w", padx=(18, 0),
+                               pady=(0, 7))
+        for token, colour in TOKEN_COLORS.items():
+            self.text_example.tag_configure(token, foreground=colour)
+        self.text_example.configure(state="disabled")
 
         ttk.Label(panel, text="Pattern", style="Field.TLabel").grid(
             row=1, column=0, sticky="w", padx=(0, 12), pady=(0, 7))
@@ -701,15 +732,17 @@ class FotoRenamer:
                                        font=(self.mono, 10))
         self.entry_pattern.grid(row=1, column=1, sticky="ew", pady=(0, 7))
 
-        chips = ttk.Frame(panel)
-        chips.grid(row=1, column=2, sticky="w", padx=(18, 0), pady=(0, 7))
+        self.token_strip = tk.Frame(panel, background=BG)
+        self.token_strip.grid(row=1, column=2, sticky="w", padx=(18, 0),
+                              pady=(0, 7))
+        self.token_blocks: list[tk.Label] = []
         self.chip_buttons: list[ttk.Button] = []
-        for token in ("{date}", "{date8}", "{time}", "{event}", "{orig}",
-                      "{cam}", "{n}", "{place}"):
-            button = ttk.Button(chips, text=token, style="Chip.TButton",
-                                command=lambda t=token: self._insert_token(t))
-            button.pack(side="left", padx=(0, 5))
-            self.chip_buttons.append(button)
+        self._strip_pattern: str | None = None
+        self._drag_from: int | None = None
+        # The line that shows where a dragged block would land. Made once and
+        # placed/unplaced, rather than created and destroyed per drag.
+        self.drop_caret = tk.Frame(self.token_strip, width=2, background=ACCENT)
+        self._rebuild_token_strip()
 
         self.lbl_event = ttk.Label(panel, textvariable=self.var_event_label,
                                     style="Field.TLabel")
@@ -1197,6 +1230,9 @@ class FotoRenamer:
         # The Place panel's example: the first ticked photo as it will come
         # out. It costs nothing here because the plan is already built.
         self.var_place_example.set(self.plans[0].new_name if self.plans else "")
+        self._rebuild_token_strip()
+        self._sync_place_position()
+        self._render_example(settings)
 
         changing = [p for p in self.plans if p.changed]
         self.var_counts.set(f"{len(self.files)} files · {len(self.plans)} ticked")
@@ -1368,8 +1404,6 @@ class FotoRenamer:
         if not is_custom:
             self.var_pattern.set(preset.pattern)
         self.entry_pattern.configure(state="normal" if is_custom else "readonly")
-        for chip in self.chip_buttons:
-            chip.state(["!disabled"] if is_custom else ["disabled"])
 
         self.var_lower.set(preset.cleanup.lowercase)
         self.var_spaces.set(preset.cleanup.spaces_to_hyphens)
@@ -1385,6 +1419,7 @@ class FotoRenamer:
         # the pattern box telling the same story.
         if self.var_place_at.get() != PLACE_OFF:
             self._apply_place_position()
+        self._rebuild_token_strip()
 
         state = "normal" if preset.needs_event or is_custom else "disabled"
         self.entry_event.configure(state=state)
@@ -1513,6 +1548,12 @@ class FotoRenamer:
             pattern = f"{{place}}_{base}" if base else "{place}"
         elif choice == "End (suffix)":
             pattern = f"{base}_{{place}}" if base else "{place}"
+        elif choice == PLACE_CUSTOM:
+            # You dragged it somewhere the dropdown has no word for. Leave it
+            # exactly there; only put it back if a preset has just wiped it out.
+            pattern = self.var_pattern.get()
+            if "{place}" not in pattern:
+                pattern = f"{base}_{{place}}" if base else "{place}"
         else:                            # Off
             pattern = base
         self.var_pattern.set(pattern)
@@ -1568,8 +1609,193 @@ class FotoRenamer:
         self._apply_place_position()
         self.refresh_preview()
 
-    def _insert_token(self, token: str) -> None:
-        self.entry_pattern.insert(self.entry_pattern.index("insert"), token)
+    # -- the pattern as blocks you can drag ---------------------------------
+    #
+    # The pattern string stays the single source of truth. A drag rewrites it
+    # through renamer.move_token and sets var_pattern; the strip then redraws
+    # itself from that text, the same as it would if you had typed the change
+    # by hand. Nothing here keeps a second copy of the order, so the strip and
+    # the pattern box can never drift apart.
+
+    def _rebuild_token_strip(self) -> None:
+        """Redraw the strip from the pattern. Cheap, and skipped if unchanged."""
+        pattern = self.var_pattern.get()
+        if pattern == self._strip_pattern:
+            return
+        self._strip_pattern = pattern
+
+        for child in self.token_strip.winfo_children():
+            if child is not self.drop_caret:
+                child.destroy()
+        self.token_blocks = []
+        self.chip_buttons = []
+
+        position = 0
+        for segment in renamer.split_pattern(pattern):
+            if segment.is_token:
+                self.token_blocks.append(self._make_block(segment.token, position))
+                position += 1
+            else:
+                # The glue between blocks, shown as it is so the strip reads
+                # like the pattern box: [date] _ [event] _ [n].
+                tk.Label(self.token_strip, text=segment.text, background=BG,
+                         foreground=MUTED, font=(self.mono, 9)).pack(side="left")
+
+        # The tokens you are not using yet, greyed out on the end. Click one to
+        # put it on the pattern, then drag it where you want it.
+        used = renamer.token_order(pattern)
+        spare = [t.strip("{}") for t in renamer.TOKEN_HELP
+                 if t.strip("{}") not in used]
+        if spare:
+            tk.Label(self.token_strip, text="   +", background=BG,
+                     foreground=LINE, font=(self.mono, 9)).pack(side="left")
+        for token in spare:
+            button = ttk.Button(self.token_strip, text=token, style="Chip.TButton",
+                                command=lambda t=token: self._add_token(t))
+            button.pack(side="left", padx=(3, 0))
+            self.chip_buttons.append(button)
+
+    def _make_block(self, token: str, position: int) -> tk.Label:
+        block = tk.Label(self.token_strip, text=token, background=BLOCK_BG,
+                         foreground=TOKEN_COLORS.get(token, TEXT),
+                         font=(self.mono, 9), padx=8, pady=4, cursor="fleur")
+        block.pack(side="left", padx=(0, 1))
+        block.token_position = position
+        block.bind("<ButtonPress-1>", self._drag_start)
+        block.bind("<B1-Motion>", self._drag_motion)
+        block.bind("<ButtonRelease-1>", self._drag_drop)
+        return block
+
+    def _strip_x(self, event) -> int:
+        """Pointer x, measured from the strip's left edge rather than the block's."""
+        return event.widget.winfo_rootx() + event.x - self.token_strip.winfo_rootx()
+
+    def _drop_slot(self, x: int) -> int:
+        """Which gap between blocks the pointer is over, 0..len(blocks)."""
+        return sum(1 for block in self.token_blocks
+                   if block.winfo_x() + block.winfo_width() / 2 < x)
+
+    def _drag_start(self, event) -> None:
+        self._drag_from = event.widget.token_position
+        event.widget.configure(background=BLOCK_BG_HELD)
+
+    def _drag_motion(self, event) -> None:
+        if self._drag_from is None:
+            return
+        slot = self._drop_slot(self._strip_x(event))
+        if slot < len(self.token_blocks):
+            edge = self.token_blocks[slot].winfo_x() - 1
+        else:
+            last = self.token_blocks[-1]
+            edge = last.winfo_x() + last.winfo_width()
+        self.drop_caret.place(x=edge, y=0, height=self.token_strip.winfo_height())
+
+    def _drag_drop(self, event) -> None:
+        frm, self._drag_from = self._drag_from, None
+        self.drop_caret.place_forget()
+        event.widget.configure(background=BLOCK_BG)
+        if frm is None:
+            return
+        target = self._drop_slot(self._strip_x(event))
+        # The slot was measured with the block still in place, so a drop to the
+        # right of where it started is one slot further than it looks once the
+        # block is lifted out.
+        if target > frm:
+            target -= 1
+        if target == frm:
+            return
+        self._switch_to_custom()
+        self.var_pattern.set(renamer.move_token(self.var_pattern.get(), frm,
+                                                target))
+        self._rebuild_token_strip()
+        self.refresh_preview()
+
+    def _add_token(self, token: str) -> None:
+        """A spare chip clicked: `token` is the bare name, e.g. "cam".
+
+        It goes on the end, because that is the one position that is always
+        available and always sensible — drag it from there.
+        """
+        self._switch_to_custom()
+        pattern = self.var_pattern.get()
+        glue = "" if not pattern or pattern.endswith(("_", "-")) else "_"
+        self.var_pattern.set(f"{pattern}{glue}{{{token}}}")
+        self._rebuild_token_strip()
+        self.refresh_preview()
+
+    def _switch_to_custom(self) -> None:
+        """Editing the pattern means the preset is now Custom.
+
+        Deliberately not a call to _on_preset_change: that also resets the four
+        cleanup switches to the preset's defaults, and silently turning
+        "lowercase" back on because you dragged a block would be a nasty little
+        surprise. This only unlocks what editing the pattern requires.
+        """
+        custom = preset_module.PRESETS_BY_KEY["custom"]
+        if self.var_preset.get() == custom.label:
+            return
+        self.var_preset.set(custom.label)
+        self.entry_pattern.configure(state="normal")
+        self.entry_event.configure(state="normal")
+        for widget in (self.spin_start, self.spin_digits):
+            widget.configure(state="normal")
+        self.lbl_note.configure(text=custom.note)
+
+    def _sync_place_position(self) -> None:
+        """Make the Place panel's Position dropdown say where {place} now is.
+
+        Dragging is the general mechanism and the dropdown is the shortcut, so
+        the dropdown follows the drag. Landing somewhere it cannot describe
+        reads as "Custom" rather than claiming a position that is no longer
+        true, and deleting {place} from the pattern by hand reads as "Off".
+
+        It runs off the pattern on every preview rather than off the drag,
+        which is what stops the dropdown and the pattern box ever telling two
+        different stories — including across a restart, where the pattern is
+        restored from settings and nothing was dragged at all.
+        """
+        order = renamer.token_order(self.var_pattern.get())
+        if "place" not in order:
+            choice = PLACE_OFF
+        elif order[0] == "place":
+            choice = "Beginning"
+        elif order[-1] == "place":
+            choice = "End (suffix)"
+        elif order[order.index("place") - 1] in ("date", "date8"):
+            choice = "After the date"
+        else:
+            choice = PLACE_CUSTOM
+        self.var_place_at.set(choice)
+
+    def _render_example(self, settings: RenameSettings) -> None:
+        """The example line, each token's characters in that token's colour."""
+        stem, spans = self._example_parts(settings)
+        self.text_example.configure(state="normal")
+        self.text_example.delete("1.0", "end")
+        self.text_example.insert("1.0", stem)
+        for token, start, end in spans:
+            self.text_example.tag_add(token, f"1.{start}", f"1.{end}")
+        self.text_example.configure(state="disabled")
+
+    def _example_parts(self, settings: RenameSettings
+                       ) -> tuple[str, list[tuple[str, int, int]]]:
+        """What to show, and which parts of it to colour.
+
+        With nothing loaded there is no real name to show, so it falls back to
+        the preset's written example, uncoloured. And if the spans ever fail to
+        rebuild the name the rename would actually produce — a truncated or
+        de-duplicated name, or a disagreement between the two code paths — the
+        real name wins and the colours are dropped. A plain example line is a
+        small loss; an example line that lies is not.
+        """
+        if settings.mode is not Mode.NEW_NAME or not self.plans:
+            return self.var_example.get(), []
+        plan = self.plans[0]
+        stem, spans = renamer.expand_with_spans(plan.photo, settings,
+                                                settings.start)
+        if stem + plan.photo.ext.lower() != plan.new_name:
+            return plan.new_name, []
+        return plan.new_name, spans
 
     # -- the two actions that touch disk ------------------------------------
 
