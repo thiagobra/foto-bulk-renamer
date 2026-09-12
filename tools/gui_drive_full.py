@@ -358,6 +358,38 @@ def sc_heic():
     print("    thumbnail slot:", "image" if a._thumb_image else "placeholder")
     a.root.destroy()
 
+def sc_metadata_dates():
+    wipe_settings()
+    print("\n[10] the dates the old metadata layer got wrong (cardC)")
+    fresh_fixtures()
+    a = new_app()
+    a.add_paths([str(FIX / "cardC")])
+    a.wait_for_dates()
+    pump(a.root)
+    by_name = {f.name: f for f in a.files}
+    check("cardC loaded all four files", len(a.files) == 4,
+          str(sorted(by_name)))
+
+    clip = by_name.get("clip.mp4")
+    check("a real .mp4 answers with the date inside its container",
+          clip is not None and clip.from_exif
+          and clip.taken_at.strftime("%Y-%m-%d %H:%M:%S") == "2026-09-17 14:22:33",
+          str(clip and (clip.taken_at, clip.from_exif)))
+
+    edited = by_name.get("edited.jpg")
+    check("an edited photo keeps its CreateDate, not the editor's ModifyDate",
+          edited is not None and edited.from_exif
+          and edited.taken_at.strftime("%Y-%m-%d") == "2026-09-15",
+          str(edited and edited.taken_at))
+
+    check("the clip sorts by its real date, after the 15 Sep photos",
+          [f.name for f in a.files][:2] == ["IMG_2001.JPG", "edited.jpg"],
+          str([f.name for f in a.files]))
+
+    check("the fake 72-byte clip in cardA still reads as undatable",
+          renamer.read_video_taken_at(FIX / "cardA" / "clip.mp4") is None)
+    a.root.destroy()
+
 def sc_screenshots(outdir):
     wipe_settings()
     print("\n[10] regenerating screenshots")
@@ -413,7 +445,7 @@ if __name__ == "__main__":
     out = sys.argv[2] if len(sys.argv) > 2 else "shots"
     todo = [sc_presets_and_modes, sc_rename_undo_restart, sc_multifolder,
             sc_deleted_midbatch, sc_locked_file, sc_thumbnail_and_selection,
-            sc_settings_persist, sc_long_name, sc_heic]
+            sc_settings_persist, sc_long_name, sc_heic, sc_metadata_dates]
     if only == "shots":
         sc_screenshots(out)
     else:

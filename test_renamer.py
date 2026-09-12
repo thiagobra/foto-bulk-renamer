@@ -77,6 +77,50 @@ def write_jpeg(path: Path, *, exif_date: str | None = None, colour=(70, 90, 120)
         img.save(path)
 
 
+def _box(kind: bytes, payload: bytes) -> bytes:
+    """One MP4 box: a 4-byte size, a 4-letter type, then the payload."""
+    return (len(payload) + 8).to_bytes(4, "big") + kind + payload
+
+
+def _mvhd(when: datetime | None, *, version: int = 0, raw: int | None = None) -> bytes:
+    """A movie header box holding `when` as MP4 counts time (from 1904).
+
+    version=1 widens the time fields to 64 bits, which is the shape half the
+    real-world files use and the one an offset mistake shows up in.
+    """
+    if raw is None:
+        raw = 0 if when is None else int(
+            (when - datetime(1904, 1, 1)).total_seconds())
+    width = 8 if version == 1 else 4
+    payload = bytes([version, 0, 0, 0])                 # version + flags
+    payload += raw.to_bytes(width, "big")               # creation time
+    payload += raw.to_bytes(width, "big")               # modification time
+    payload += (1000).to_bytes(4, "big")                # timescale
+    payload += (5000).to_bytes(width, "big")            # duration
+    payload += b"\x00" * 80                             # rate, volume, matrix…
+    return _box(b"mvhd", payload)
+
+
+def write_mp4(path: Path, *, created: datetime | None = None, version: int = 0,
+              raw: int | None = None, day: str | None = None,
+              truncate: int = 0) -> None:
+    """A real (if tiny) MP4 container, built to order.
+
+    day writes a moov/udta/©day string; created (or raw) writes a moov/mvhd
+    integer; truncate lops bytes off the end to make a damaged file.
+    """
+    moov = b""
+    if day is not None:
+        text = day.encode("utf-8")
+        atom = _box(b"\xa9day",
+                    len(text).to_bytes(2, "big") + b"\x55\xc4" + text)
+        moov += _box(b"udta", atom)
+    if created is not None or raw is not None:
+        moov += _mvhd(created, version=version, raw=raw)
+    data = _box(b"ftyp", b"mp42\x00\x00\x00\x00mp42isom") + _box(b"moov", moov)
+    path.write_bytes(data[:-truncate] if truncate else data)
+
+
 # --------------------------------------------------------------------------
 
 class TestHelpers(unittest.TestCase):
@@ -914,6 +958,153 @@ class TestHeicSupport(unittest.TestCase):
             self.assertEqual(taken, datetime(2026, 6, 12, 14, 22, 33))
 
 
+class TestVideoDates(unittest.TestCase):
+    """Reading a clip's capture date out of its container.
+
+    Every case here is one of the traps a real file walks into: the 1904
+    epoch, the 64-bit version, encoders that write a Unix timestamp into a
+    field defined against 1904, and files that are simply broken.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_a_version_0_mvhd_is_read(self):
+        path = self.dir / "v0.mp4"
+        write_mp4(path, created=datetime(2026, 6, 12, 14, 22, 33))
+        self.assertEqual(renamer.read_video_taken_at(path),
+                         datetime(2026, 6, 12, 14, 22, 33))
+
+    def test_a_version_1_mvhd_is_read(self):
+        """Version 1 stores the time as 64 bits and shifts everything after
+        it by four bytes. Reading it as version 0 gives a date in 1904."""
+        path = self.dir / "v1.mp4"
+        write_mp4(path, created=datetime(2026, 6, 12, 14, 22, 33), version=1)
+        self.assertEqual(renamer.read_video_taken_at(path),
+                         datetime(2026, 6, 12, 14, 22, 33))
+
+    def test_a_unix_timestamp_written_into_the_1904_field_is_patched(self):
+        """Plenty of encoders get the epoch wrong. Without the patch this
+        file dates to 1838 — exiftool takes the same view."""
+        path = self.dir / "wrong-epoch.mp4"
+        unix = int((datetime(2026, 6, 12, 14, 22, 33)
+                    - datetime(1970, 1, 1)).total_seconds())
+        self.assertLess(unix, renamer.MP4_EPOCH_OFFSET)
+        write_mp4(path, raw=unix)
+        self.assertEqual(renamer.read_video_taken_at(path),
+                         datetime(2026, 6, 12, 14, 22, 33))
+
+    def test_a_zero_creation_time_means_absent_not_1904(self):
+        path = self.dir / "zero.mp4"
+        write_mp4(path, raw=0)
+        self.assertIsNone(renamer.read_video_taken_at(path))
+
+    def test_the_day_string_is_preferred_over_mvhd(self):
+        path = self.dir / "both.mp4"
+        write_mp4(path, created=datetime(2020, 1, 1, 0, 0, 0),
+                  day="2026-06-12T14:22:33+0200")
+        self.assertEqual(renamer.read_video_taken_at(path),
+                         datetime(2026, 6, 12, 14, 22, 33))
+
+    def test_a_day_string_without_a_time_is_still_a_date(self):
+        path = self.dir / "dateonly.mp4"
+        write_mp4(path, day="2026-06-12")
+        self.assertEqual(renamer.read_video_taken_at(path),
+                         datetime(2026, 6, 12, 0, 0, 0))
+
+    def test_an_unreadable_day_string_falls_back_to_mvhd(self):
+        path = self.dir / "junkday.mp4"
+        write_mp4(path, created=datetime(2026, 6, 12, 14, 22, 33),
+                  day="not a date at all")
+        self.assertEqual(renamer.read_video_taken_at(path),
+                         datetime(2026, 6, 12, 14, 22, 33))
+
+    def test_a_truncated_file_returns_none_rather_than_raising(self):
+        path = self.dir / "cut.mp4"
+        write_mp4(path, created=datetime(2026, 6, 12, 14, 22, 33), truncate=40)
+        self.assertIsNone(renamer.read_video_taken_at(path))
+
+    def test_a_file_with_no_moov_at_all_returns_none(self):
+        """The 72-byte fake clip tools/make_fixtures.py writes."""
+        path = self.dir / "fake.mp4"
+        path.write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 64)
+        self.assertIsNone(renamer.read_video_taken_at(path))
+
+    def test_a_missing_file_returns_none(self):
+        self.assertIsNone(renamer.read_video_taken_at(self.dir / "nope.mp4"))
+
+    def test_a_box_claiming_a_size_past_the_end_of_the_file_is_ignored(self):
+        path = self.dir / "liar.mp4"
+        path.write_bytes((1 << 30).to_bytes(4, "big") + b"moov" + b"\x00" * 32)
+        self.assertIsNone(renamer.read_video_taken_at(path))
+
+    def test_read_taken_at_uses_the_container_for_a_video(self):
+        path = self.dir / "clip.mp4"
+        write_mp4(path, created=datetime(2026, 6, 12, 14, 22, 33))
+        taken_at, from_exif = renamer.read_taken_at(path)
+        self.assertEqual(taken_at, datetime(2026, 6, 12, 14, 22, 33))
+        self.assertTrue(from_exif)
+
+    def test_a_video_without_a_date_still_falls_back_to_the_file_time(self):
+        path = self.dir / "bare.mp4"
+        write_mp4(path, raw=0)
+        taken_at, from_exif = renamer.read_taken_at(path)
+        self.assertFalse(from_exif)
+        self.assertEqual(taken_at,
+                         datetime.fromtimestamp(path.stat().st_mtime))
+
+    def test_the_scan_picks_up_a_video_date(self):
+        write_mp4(self.dir / "clip.mov", created=datetime(2026, 6, 12, 14, 22, 33))
+        files, _ = renamer.scan_paths([self.dir])
+        self.assertEqual(files[0].taken_at, datetime(2026, 6, 12, 14, 22, 33))
+        self.assertTrue(files[0].from_exif)
+
+    def test_a_big_clip_is_seeked_over_not_read(self):
+        """The moov box sits after 4 MB of payload; reading it all would be
+        the difference between instant and not on a folder of clips."""
+        path = self.dir / "big.mp4"
+        write_mp4(path, created=datetime(2026, 6, 12, 14, 22, 33))
+        tail = path.read_bytes()
+        filler = _box(b"mdat", b"\x00" * 4_000_000)
+        path.write_bytes(tail[:24] + filler + tail[24:])
+
+        reads = []
+
+        class CountingFile:
+            """Passes everything through to a real file, noting each read."""
+
+            def __init__(self, handle):
+                self._handle = handle
+
+            def read(self, size=-1):
+                reads.append(size)
+                return self._handle.read(size)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return self._handle.__exit__(*exc)
+
+            def __getattr__(self, name):
+                return getattr(self._handle, name)
+
+        import builtins
+        real_builtin_open = builtins.open
+        builtins.open = lambda *a, **k: CountingFile(real_builtin_open(*a, **k))
+        try:
+            taken = renamer.read_video_taken_at(path)
+        finally:
+            builtins.open = real_builtin_open
+        self.assertEqual(taken, datetime(2026, 6, 12, 14, 22, 33))
+        self.assertLess(sum(size for size in reads if size > 0), 1000,
+                        "the whole clip was read to find its date")
+
+
 class TestDateChain(unittest.TestCase):
     """Which EXIF tag wins, and why it matters.
 
@@ -1239,23 +1430,32 @@ class TestExifBackfill(unittest.TestCase):
             should_stop=lambda: len(results) >= 2)
         self.assertEqual((done, len(results)), (2, 2))
 
-    def test_a_video_is_reported_without_being_opened(self):
-        """Videos carry no EXIF, so re-reading them would be pure waste."""
-        (self.dir / "clip.mp4").write_bytes(b"not really a video")
+    def test_a_video_is_read_for_the_date_in_its_container(self):
+        """Videos used to be skipped here, on the grounds that they carry no
+        EXIF. True, and the wrong thing to do: the capture date is in the
+        container, and the modified time they were left with is rewritten by
+        the copy off the phone."""
+        write_mp4(self.dir / "clip.mp4", created=datetime(2026, 6, 12, 14, 22, 33))
         files, _ = renamer.scan_paths([self.dir], read_exif=False)
         scanned_date = files[0].taken_at
 
-        opened = []
-        real_read = renamer.read_taken_at
-        renamer.read_taken_at = lambda *a, **k: opened.append(1) or real_read(*a, **k)
-        try:
-            results = []
-            renamer.backfill_exif_dates(files, on_result=lambda *r: results.append(r))
-        finally:
-            renamer.read_taken_at = real_read
+        results = []
+        renamer.backfill_exif_dates(files, on_result=lambda *r: results.append(r))
 
-        self.assertEqual(opened, [], "a video was re-read for EXIF it cannot have")
+        self.assertEqual(results[0][1], datetime(2026, 6, 12, 14, 22, 33))
+        self.assertTrue(results[0][2], "the container date was not marked as read")
+        self.assertNotEqual(results[0][1], scanned_date,
+                            "the fast scan already had the right date by luck")
+
+    def test_a_video_with_nothing_in_it_keeps_the_file_date(self):
+        (self.dir / "junk.mp4").write_bytes(b"not really a video")
+        files, _ = renamer.scan_paths([self.dir], read_exif=False)
+        scanned_date = files[0].taken_at
+
+        results = []
+        renamer.backfill_exif_dates(files, on_result=lambda *r: results.append(r))
         self.assertEqual(results[0][1], scanned_date)
+        self.assertFalse(results[0][2])
 
     def test_a_file_deleted_mid_backfill_keeps_the_date_it_had(self):
         write_jpeg(self.dir / "IMG_0001.jpg", exif_date="2026:06:12 14:22:33")

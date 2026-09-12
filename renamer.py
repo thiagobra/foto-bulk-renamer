@@ -21,7 +21,7 @@ import re
 import sys
 import unicodedata
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
 
@@ -90,6 +90,11 @@ class PhotoFile:
     path: Path
     taken_at: datetime
     size: int
+    # "The date came from inside the file, not from its modified time." For an
+    # image that means EXIF; for a video, the container's own boxes. The name
+    # predates videos being readable and is left alone on purpose: renaming it
+    # would touch two tuples, four unpack sites and both GUI drives, for no
+    # behaviour change at all.
     from_exif: bool = False
 
     # Derived once, in __post_init__. resolve() is a realpath syscall; strftime
@@ -143,16 +148,23 @@ class PhotoFile:
 
 
 def read_taken_at(path: Path, *, use_exif: bool = True) -> tuple[datetime, bool]:
-    """Return (date the photo was taken, whether it came from EXIF).
+    """Return (date the photo was taken, whether it came from embedded metadata).
 
-    Falls back to the file's modified time, which is what videos and
-    screenshots have instead of EXIF.
+    Images answer from EXIF, videos from their container's own boxes. Falls
+    back to the file's modified time, which is what a screenshot — or a clip
+    with nothing written in it — has instead.
 
-    use_exif=False skips the Pillow open entirely and goes straight to the
+    use_exif=False skips the metadata read entirely and goes straight to the
     modified time. That is not a second code path, just an early exit down the
     fallback this function already ends on: it lets a big drop appear in the
     window immediately while the real dates are read on a worker thread.
     """
+    if use_exif and path.suffix.lower() in VIDEO_EXTS:
+        # Copying a clip off a phone rewrites its modified time, so the
+        # container is the only place its real date survives.
+        taken_at = read_video_taken_at(path)
+        if taken_at is not None:
+            return taken_at, True
     if use_exif and Image is not None and path.suffix.lower() in IMAGE_EXTS:
         try:
             with Image.open(path) as img:
@@ -183,6 +195,160 @@ def read_taken_at(path: Path, *, use_exif: bool = True) -> tuple[datetime, bool]
             # A corrupt or unreadable header must never stop the app.
             pass
     return datetime.fromtimestamp(path.stat().st_mtime), False
+
+
+# QuickTime and MP4 count seconds from 1904-01-01; Unix counts from 1970.
+MP4_EPOCH_OFFSET = 2_082_844_800
+
+# A malformed file must not be able to spin this forever.
+MAX_BOXES = 1000
+
+# The longest ©day string worth reading. Real ones are about 25 characters.
+MAX_DAY_TEXT = 512
+
+# "2026-06-12T14:22:33+0200", "2026:06:12 14:22:33", "2026-06-12" — every
+# shape a ©day atom turns up in, reduced to the six numbers we want. The
+# offset at the end is deliberately ignored: taken_at is naive everywhere
+# else in this file, and a UTC conversion here would only disagree with it.
+_DAY_PATTERN = re.compile(
+    r"(\d{4})[-:]?(\d{2})[-:]?(\d{2})"
+    r"(?:[T ](\d{2}):?(\d{2})(?::?(\d{2}))?)?")
+
+
+def _iter_boxes(stream, start: int, end: int):
+    """Walk the MP4/QuickTime boxes lying between `start` and `end`.
+
+    Yields (four-letter type, payload start, payload end) and seeks over each
+    box rather than reading it, which is what makes a 4 GB clip cost the same
+    as a 4 MB one. Stops rather than raises on anything that does not add up.
+    """
+    offset = start
+    for _ in range(MAX_BOXES):
+        if offset + 8 > end:
+            return
+        stream.seek(offset)
+        header = stream.read(8)
+        if len(header) < 8:
+            return
+        size = int.from_bytes(header[:4], "big")
+        kind = header[4:8]
+        header_size = 8
+        if size == 1:
+            # Size 1 means the real, 64-bit size follows the header.
+            extra = stream.read(8)
+            if len(extra) < 8:
+                return
+            size = int.from_bytes(extra, "big")
+            header_size = 16
+        elif size == 0:
+            # Size 0 means "this box runs to the end of the file".
+            size = end - offset
+        if size < header_size or offset + size > end:
+            return          # truncated or nonsense; take what we have
+        yield kind, offset + header_size, offset + size
+        offset += size
+
+
+def _mp4_epoch_to_datetime(raw: int) -> datetime | None:
+    """One of the two integers an mvhd box may hold, as a date.
+
+    Two traps, both taken from exiftool's own conversion. Zero means the tag
+    is absent, not midnight on 1 January 1904. And plenty of encoders write a
+    Unix timestamp into a field defined against 1904 — exiftool patches those
+    rather than reporting a clip from 1838, so we do the same.
+
+    The result is deliberately naive and unconverted: phones overwhelmingly
+    write local wall-clock time here, and shifting it by the machine's own
+    timezone would move a late-evening clip into the wrong day.
+    """
+    if not raw:
+        return None
+    seconds = raw - MP4_EPOCH_OFFSET if raw >= MP4_EPOCH_OFFSET else raw
+    try:
+        return datetime(1970, 1, 1) + timedelta(seconds=seconds)
+    except (OverflowError, ValueError):
+        return None
+
+
+def _read_mvhd(stream, start: int, end: int) -> datetime | None:
+    """The movie header's creation time. Always present, least trustworthy."""
+    stream.seek(start)
+    payload = stream.read(min(end - start, 32))
+    if len(payload) < 8:
+        return None
+    # Byte 0 is the version; version 1 widens every time field to 64 bits
+    # and shifts everything after them by four bytes.
+    if payload[0] == 1:
+        if len(payload) < 12:
+            return None
+        return _mp4_epoch_to_datetime(int.from_bytes(payload[4:12], "big"))
+    return _mp4_epoch_to_datetime(int.from_bytes(payload[4:8], "big"))
+
+
+def _read_udta_day(stream, start: int, end: int) -> datetime | None:
+    """moov/udta/©day — the ISO 8601 string, when the camera wrote one.
+
+    A plain string, so there is no epoch to guess at. That is why it is
+    preferred over mvhd.
+    """
+    for kind, box_start, box_end in _iter_boxes(stream, start, end):
+        if kind != b"\xa9day":
+            continue
+        stream.seek(box_start)
+        raw = stream.read(min(box_end - box_start, MAX_DAY_TEXT))
+        # QuickTime text atoms usually start with a 2-byte length and a
+        # 2-byte language code; some writers just put the text in. Trying
+        # the header first and falling back covers both.
+        text = raw.decode("utf-8", "ignore")
+        if len(raw) >= 4:
+            declared = int.from_bytes(raw[:2], "big")
+            if declared and declared <= len(raw) - 4:
+                text = raw[4:4 + declared].decode("utf-8", "ignore")
+        match = _DAY_PATTERN.search(text)
+        if match:
+            year, month, day, hour, minute, second = match.groups()
+            try:
+                return datetime(int(year), int(month), int(day),
+                                int(hour or 0), int(minute or 0), int(second or 0))
+            except ValueError:
+                return None
+    return None
+
+
+def read_video_taken_at(path: Path) -> datetime | None:
+    """Capture time from an MP4/MOV/3GP container, or None if it has none.
+
+    Seeks between box headers rather than reading the file, so a 4 GB clip
+    costs the same as a 4 MB one. Returns None rather than raising on
+    anything malformed — a container we cannot parse is not an error, it just
+    means the modified time is still the best answer we have.
+
+    Two sources, in order of how much they can be trusted:
+
+        1. moov/udta/©day — an ISO 8601 string, so nothing to guess at
+        2. moov/mvhd      — an integer, always present, full of traps
+    """
+    try:
+        with open(path, "rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            end = stream.tell()
+            for kind, start, stop in _iter_boxes(stream, 0, end):
+                if kind != b"moov":
+                    continue
+                mvhd = None
+                for child, child_start, child_end in _iter_boxes(stream, start, stop):
+                    if child == b"udta":
+                        stamped = _read_udta_day(stream, child_start, child_end)
+                        if stamped is not None:
+                            return stamped
+                    elif child == b"mvhd" and mvhd is None:
+                        mvhd = (child_start, child_end)
+                if mvhd is not None:
+                    return _read_mvhd(stream, *mvhd)
+                return None
+    except (OSError, ValueError):
+        return None
+    return None
 
 
 def natural_key(text: str) -> list:
@@ -249,8 +415,8 @@ def backfill_exif_dates(files, *, on_result, should_stop=None) -> int:
     is what makes it testable without opening a window.
 
     on_result(photo, taken_at, from_exif) is called once per file, in order,
-    including for files that turn out to have no EXIF date at all — the caller
-    needs those to show honest progress. It must not mutate `photo` itself if
+    including for files that turn out to have no embedded date at all — the
+    caller needs those to show honest progress. It must not mutate `photo` itself if
     it is running off the UI thread; hand the values across and apply them
     there.
 
@@ -261,18 +427,18 @@ def backfill_exif_dates(files, *, on_result, should_stop=None) -> int:
     for photo in files:
         if should_stop is not None and should_stop():
             return done
-        if photo.ext.lower() not in IMAGE_EXTS:
-            # A video has no EXIF; the modified time it already has is all
-            # there is. Say so rather than paying to find out again.
-            on_result(photo, photo.taken_at, photo.from_exif)
-        else:
-            try:
-                taken_at, from_exif = read_taken_at(photo.path)
-            except OSError:
-                # Unplugged or deleted since the scan. The date it already
-                # has stands, and the rename will report the failure.
-                taken_at, from_exif = photo.taken_at, photo.from_exif
-            on_result(photo, taken_at, from_exif)
+        try:
+            # Videos come through here too. They used to be skipped on the
+            # grounds that they carry no EXIF, which is true and was doing the
+            # wrong thing: their capture date is in the container, and the
+            # modified time they were left with is rewritten by the copy off
+            # the phone.
+            taken_at, from_exif = read_taken_at(photo.path)
+        except OSError:
+            # Unplugged or deleted since the scan. The date it already has
+            # stands, and the rename will report the failure.
+            taken_at, from_exif = photo.taken_at, photo.from_exif
+        on_result(photo, taken_at, from_exif)
         done += 1
     return done
 
