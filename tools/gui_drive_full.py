@@ -390,6 +390,109 @@ def sc_metadata_dates():
           renamer.read_video_taken_at(FIX / "cardA" / "clip.mp4") is None)
     a.root.destroy()
 
+def sc_place_panel():
+    wipe_settings()
+    print("\n[11] the Place panel: a trip in two cities, one rename")
+    fresh_fixtures()
+    a = new_app()
+    a.add_paths([str(FIX / "cardC")])
+    a.wait_for_dates()
+    a.var_event.set("trip")
+    a.var_place_open.set(True); a._sync_place_panel()
+    pump(a.root)
+    check("the panel starts folded away, and opens on demand",
+          a.place_body.winfo_ismapped() == 1)
+
+    a.var_city.set("New York City")
+    a.var_from_date.set("2026-09-15"); a.var_from_time.set("00:00")
+    a.var_to_date.set("2026-09-15"); a.var_to_time.set("23:59")
+    a._add_stay(); pump(a.root)
+    check("the first stay switches the token on by itself",
+          a.var_pattern.get() == "{date}_{event}_{n}_{place}", a.var_pattern.get())
+
+    a.var_city.set("Boston")
+    a.var_from_date.set("2026-09-16"); a.var_to_date.set("2026-09-20")
+    a._add_stay(); pump(a.root)
+    a.var_city.set("Fenway Park")
+    a.var_from_date.set("2026-09-17"); a.var_from_time.set("13:00")
+    a.var_to_date.set("2026-09-17"); a.var_to_time.set("18:00")
+    a._add_stay(); pump(a.root)
+    check("all three stays are listed, earliest first",
+          [a.stay_tree.item(i)["values"][1] for i in a.stay_tree.get_children()]
+          == ["New York City", "Boston", "Fenway Park"],
+          str([a.stay_tree.item(i)["values"] for i in a.stay_tree.get_children()]))
+
+    named = {p.photo.name: p.new_name for p in a.plans}
+    check("a 15 Sep photo is named after New York City",
+          named["IMG_2001.JPG"].endswith("_new-york-city.jpg"), str(named))
+    check("a 17 Sep morning photo is named after Boston",
+          named["IMG_2002.JPG"].endswith("_boston.jpg"), str(named))
+    check("the clip inside the narrower stay takes Fenway Park",
+          named["clip.mp4"].endswith("_fenway-park.mp4"), str(named))
+    check("the edited photo follows its CreateDate into New York City",
+          named["edited.jpg"].endswith("_new-york-city.jpg"), str(named))
+    check("the example line is the first ticked photo",
+          a.var_place_example.get() == a.plans[0].new_name,
+          a.var_place_example.get())
+
+    for position, expected in (("Beginning", "{place}_{date}_{event}_{n}"),
+                               ("After the date", "{date}_{place}_{event}_{n}"),
+                               ("End (suffix)", "{date}_{event}_{n}_{place}"),
+                               ("Off", "{date}_{event}_{n}")):
+        a.var_place_at.set(position); a._on_place_position_change(); pump(a.root)
+        check(f"Position {position!r} rewrites the pattern ({a.var_pattern.get()})",
+              a.var_pattern.get() == expected, a.var_pattern.get())
+
+    a.var_place_at.set("End (suffix)"); a._on_place_position_change(); pump(a.root)
+    a.var_city.set(""); a._add_stay(); pump(a.root)
+    check("a stay with no city is refused with a readable reason",
+          "place" in a.var_status.get() and len(a.stays) == 3, a.var_status.get())
+    a.var_city.set("Nowhere"); a.var_from_date.set("15/09/2026")
+    a._add_stay(); pump(a.root)
+    check("a stay with an unreadable date is refused the same way",
+          "not a date" in a.var_status.get() and len(a.stays) == 3,
+          a.var_status.get())
+
+    # A preset rewrites the pattern; the place must not vanish with it.
+    import presets as pm
+    a.var_preset.set(pm.PRESETS_BY_KEY["date_time"].label)
+    a._on_preset_change(); pump(a.root)
+    check("a preset change keeps the place in the pattern",
+          "{place}" in a.var_pattern.get(), a.var_pattern.get())
+    a.var_preset.set(pm.PRESETS_BY_KEY["date_event_n"].label)
+    a._on_preset_change(); pump(a.root)
+
+    original = names(FIX / "cardC")
+    a.do_rename(); pump(a.root)
+    after = names(FIX / "cardC")
+    check("the whole trip renamed in one pass, each file to its own city",
+          sum("new-york-city" in n for n in after) == 2
+          and sum("boston" in n for n in after) == 1
+          and sum("fenway-park" in n for n in after) == 1, str(after))
+    a.do_undo(); pump(a.root)
+    check("undo restored every name", names(FIX / "cardC") == original,
+          str(names(FIX / "cardC")))
+
+    # Delete a stay through the ✕ column, then check it stops applying.
+    a.stays.pop(0)
+    a._refresh_stay_rows(); a._sync_place_panel(); a.refresh_preview(); pump(a.root)
+    named = {p.photo.name: p.new_name for p in a.plans}
+    check("removing a stay leaves its photos with no place, and no stray _",
+          named["IMG_2001.JPG"] == "2026-09-15_trip_001.jpg", str(named))
+    a._on_close()
+
+    b = new_app()
+    check("the trip list survived closing and reopening the app",
+          [s.place for s in b.stays] == ["Boston", "Fenway Park"],
+          str([s.place for s in b.stays]))
+    check("the panel reopens because there are stays in it",
+          b.var_place_open.get() is True)
+    check("the remembered cities are back in the dropdown",
+          "New York City" in b.cities, str(b.cities))
+    check("the pattern still carries the token",
+          "{place}" in b.var_pattern.get(), b.var_pattern.get())
+    b.root.destroy()
+
 def sc_screenshots(outdir):
     wipe_settings()
     print("\n[10] regenerating screenshots")
@@ -445,7 +548,8 @@ if __name__ == "__main__":
     out = sys.argv[2] if len(sys.argv) > 2 else "shots"
     todo = [sc_presets_and_modes, sc_rename_undo_restart, sc_multifolder,
             sc_deleted_midbatch, sc_locked_file, sc_thumbnail_and_selection,
-            sc_settings_persist, sc_long_name, sc_heic, sc_metadata_dates]
+            sc_settings_persist, sc_long_name, sc_heic, sc_metadata_dates,
+            sc_place_panel]
     if only == "shots":
         sc_screenshots(out)
     else:

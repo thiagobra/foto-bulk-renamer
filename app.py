@@ -21,6 +21,7 @@ import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
+from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -65,6 +66,12 @@ INSERT_LABELS = {
     "End": InsertPosition.END,
 }
 INSERT_LABEL_BY_VALUE = {v: k for k, v in INSERT_LABELS.items()}
+
+# Where the Place panel puts {place} in the pattern. These rewrite the pattern
+# text rather than switching on a placement mode, so the pattern box stays the
+# one source of truth and you can see where the place went.
+PLACE_OFF = "Off"
+PLACE_POSITIONS = (PLACE_OFF, "Beginning", "After the date", "End (suffix)")
 
 
 # --------------------------------------------------------------------------
@@ -196,6 +203,9 @@ class FotoRenamer:
         # each one. Kept in step by apply_moves, thrown away by invalidate.
         self.dir_index = renamer.DirectoryIndex()
 
+        # The window height to go back to when the Place panel folds away.
+        self._height_without_place: int | None = None
+
         self._preview_job: str | None = None
         self._tick_job: str | None = None        # the 120 ms background tick
         self._thumb_token = 0
@@ -210,6 +220,12 @@ class FotoRenamer:
         self._exif_total = 0
         self._exif_read: set[Path] = set()       # resolved paths already tried
         self._scan_note = ""                     # status line to put back after
+
+        # The trip list, and the cities it has taught us. Both are filled in
+        # by _load_settings before any widget exists, so the panel can render
+        # them as it is built.
+        self.stays: list[renamer.Stay] = []
+        self.cities: list[str] = []
 
         self.settings_file = renamer.app_data_dir() / "settings.json"
         self._restored_geometry = False
@@ -259,6 +275,17 @@ class FotoRenamer:
         self.var_replace = tk.StringVar(value="")
         self.var_match_case = tk.BooleanVar(value=False)
 
+        today = datetime.now().strftime("%Y-%m-%d")
+        self.var_city = tk.StringVar(value="")
+        self.var_from_date = tk.StringVar(value=today)
+        self.var_from_time = tk.StringVar(value="00:00")
+        self.var_to_date = tk.StringVar(value=today)
+        self.var_to_time = tk.StringVar(value="23:59")
+        self.var_place_at = tk.StringVar(value=PLACE_OFF)
+        self.var_place_example = tk.StringVar(value="")
+        self.var_place_open = tk.BooleanVar(value=False)
+        self.var_place_toggle = tk.StringVar(value="")
+
         self.var_lower = tk.BooleanVar(value=True)
         self.var_spaces = tk.BooleanVar(value=True)
         self.var_accents = tk.BooleanVar(value=True)
@@ -301,17 +328,24 @@ class FotoRenamer:
             "insert_text": self.var_insert_text, "insert_at": self.var_insert_at,
             "separator": self.var_separator, "nth": self.var_nth,
             "char": self.var_char, "find": self.var_find,
-            "replace": self.var_replace,
+            "replace": self.var_replace, "place_at": self.var_place_at,
         }
         for key, var in mapping.items():
             if isinstance(data.get(key), str):
                 var.set(data[key])
         for key, var in (("match_case", self.var_match_case),
+                         ("place_open", self.var_place_open),
                          ("lower", self.var_lower), ("spaces", self.var_spaces),
                          ("accents", self.var_accents),
                          ("collapse", self.var_collapse)):
             if isinstance(data.get(key), bool):
                 var.set(data[key])
+        self.cities = [c for c in data.get("cities", []) if isinstance(c, str)]
+        self.stays = self._stays_from_saved(data.get("stays"))
+        if self.stays:
+            # A trip list you cannot see is a trap: once there is one, the
+            # panel opens whatever was saved.
+            self.var_place_open.set(True)
         geometry = self._onscreen_geometry(data.get("geometry"))
         if geometry:
             try:
@@ -320,6 +354,31 @@ class FotoRenamer:
             except tk.TclError:
                 pass
         return data
+
+    @staticmethod
+    def _stays_from_saved(saved) -> list[renamer.Stay]:
+        """Rebuild the trip list from settings.json.
+
+        Stored as [start_iso, end_iso, place] triples, which datetime round-
+        trips with no custom JSON encoder. A row that does not read back is
+        dropped rather than taking the whole file down with it: a broken
+        settings file must never stop the app opening.
+        """
+        stays: list[renamer.Stay] = []
+        if not isinstance(saved, list):
+            return stays
+        for row in saved:
+            if not (isinstance(row, list) and len(row) == 3):
+                continue
+            try:
+                start, end, place = row
+                stays.append(renamer.Stay(start=datetime.fromisoformat(start),
+                                          end=datetime.fromisoformat(end),
+                                          place=str(place)))
+            except (TypeError, ValueError):
+                continue
+        stays.sort(key=lambda stay: (stay.start, stay.end))
+        return stays
 
     def _onscreen_geometry(self, geometry) -> str | None:
         """Drop a saved position that would open the window off-screen.
@@ -354,6 +413,11 @@ class FotoRenamer:
             "accents": self.var_accents.get(),
             "collapse": self.var_collapse.get(),
             "geometry": self.root.winfo_geometry(),
+            "place_at": self.var_place_at.get(),
+            "place_open": self.var_place_open.get(),
+            "cities": self.cities,
+            "stays": [[stay.start.isoformat(), stay.end.isoformat(), stay.place]
+                      for stay in self.stays],
         }
         try:
             self.settings_file.write_text(json.dumps(data, indent=2),
@@ -398,12 +462,15 @@ class FotoRenamer:
                         padding=(30, 17))
         style.configure("Tall.TButton", font=(self.font, 10), padding=(16, 11))
         style.configure("Chip.TButton", font=(self.mono, 9), padding=(9, 5))
+        style.configure("Place.Toggle.TButton", font=(self.font, 10),
+                        padding=(12, 7))
         style.configure("Seg.Toggle.TButton", font=(self.font, 10), padding=(20, 12))
         style.configure("TEntry", padding=(8, 9))
         style.configure("TCombobox", padding=(8, 9))
         style.configure("TSpinbox", padding=(6, 9))
         style.configure("TCheckbutton", font=(self.font, 10))
 
+        style.configure("Stay.Treeview", rowheight=26, font=(self.font, 10))
         style.configure("Treeview", rowheight=34, font=(self.font, 10),
                         background=SUNKEN, fieldbackground=SUNKEN,
                         borderwidth=0)
@@ -638,7 +705,7 @@ class FotoRenamer:
         chips.grid(row=1, column=2, sticky="w", padx=(18, 0), pady=(0, 7))
         self.chip_buttons: list[ttk.Button] = []
         for token in ("{date}", "{date8}", "{time}", "{event}", "{orig}",
-                      "{cam}", "{n}"):
+                      "{cam}", "{n}", "{place}"):
             button = ttk.Button(chips, text=token, style="Chip.TButton",
                                 command=lambda t=token: self._insert_token(t))
             button.pack(side="left", padx=(0, 5))
@@ -668,7 +735,100 @@ class FotoRenamer:
 
         self.lbl_note = ttk.Label(panel, text="", style="Muted.TLabel")
         self.lbl_note.grid(row=3, column=1, columnspan=2, sticky="w", pady=(6, 0))
+
+        self._build_place_panel(panel)
         return panel
+
+    def _build_place_panel(self, parent: ttk.Frame) -> None:
+        """The trip list: "15 Sep I was in New York City, 16-20 Sep Boston".
+
+        No naming rule lives here. The boxes are handed to renamer.parse_stay,
+        which either returns a Stay or raises a sentence for the status line,
+        and the list itself is plain data that current_settings passes down.
+
+        It only appears in New name mode, which is the only mode {place} means
+        anything in: Insert text and Find & replace promise to leave the
+        original name alone.
+        """
+        shell = ttk.Frame(parent)
+        shell.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+        shell.columnconfigure(0, weight=1)
+        ttk.Separator(shell, orient="horizontal").grid(
+            row=0, column=0, sticky="ew", pady=(0, 8))
+
+        # Folded away until it is wanted. The panel is 200 pixels tall, and
+        # spending those on every user who never names a photo after a city
+        # would cost the file list five of its rows.
+        self.button_place = ttk.Button(shell, textvariable=self.var_place_toggle,
+                                       style="Place.Toggle.TButton",
+                                       command=self._toggle_place_panel)
+        self.button_place.grid(row=1, column=0, sticky="w")
+
+        place = ttk.Frame(shell)
+        self.place_body = place
+        place.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        place.columnconfigure(1, weight=1)
+
+        form = ttk.Frame(place)
+        form.grid(row=1, column=0, sticky="nw", padx=(0, 18))
+
+        ttk.Label(form, text="City", style="Field.TLabel").grid(
+            row=0, column=0, sticky="w", padx=(0, 12), pady=(0, 5))
+        self.combo_city = ttk.Combobox(form, textvariable=self.var_city,
+                                       values=self.cities, width=24,
+                                       font=(self.font, 10))
+        self.combo_city.grid(row=0, column=1, columnspan=2, sticky="ew",
+                             pady=(0, 5))
+
+        for row, (label, date_var, time_var) in enumerate((
+                ("From", self.var_from_date, self.var_from_time),
+                ("To", self.var_to_date, self.var_to_time)), start=1):
+            ttk.Label(form, text=label, style="Field.TLabel").grid(
+                row=row, column=0, sticky="w", padx=(0, 12), pady=(0, 5))
+            ttk.Entry(form, textvariable=date_var, width=13,
+                      font=(self.mono, 10)).grid(row=row, column=1, sticky="w",
+                                                 pady=(0, 5))
+            ttk.Entry(form, textvariable=time_var, width=7,
+                      font=(self.mono, 10)).grid(row=row, column=2, sticky="w",
+                                                 padx=(8, 0), pady=(0, 5))
+
+        self.button_add_stay = ttk.Button(form, text="Add", style="Tall.TButton",
+                                          command=self._add_stay)
+        self.button_add_stay.grid(row=1, column=3, rowspan=2, padx=(14, 0),
+                                  sticky="ns")
+
+        # The list. Three columns, the last one a ✕ that deletes the row —
+        # the same click-on-a-column trick the file list uses for its ticks.
+        self.stay_tree = ttk.Treeview(place, columns=("when", "place", "del"),
+                                      show="headings", selectmode="browse",
+                                      style="Stay.Treeview", height=4)
+        self.stay_tree.heading("when", text="When")
+        self.stay_tree.heading("place", text="Place")
+        self.stay_tree.heading("del", text="")
+        self.stay_tree.column("when", width=190, minwidth=130, anchor="w")
+        self.stay_tree.column("place", width=190, minwidth=110, anchor="w")
+        self.stay_tree.column("del", width=40, minwidth=40, anchor="center",
+                              stretch=False)
+        self.stay_tree.tag_configure("stripe", background=STRIPE)
+        self.stay_tree.grid(row=1, column=1, sticky="nsew")
+        self.stay_tree.bind("<Button-1>", self._on_stay_click)
+
+        footer = ttk.Frame(place)
+        footer.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        ttk.Label(footer, text="Position", style="Field.TLabel").pack(
+            side="left", padx=(0, 12))
+        self.combo_place_at = ttk.Combobox(footer, textvariable=self.var_place_at,
+                                           state="readonly", width=18,
+                                           values=list(PLACE_POSITIONS),
+                                           font=(self.font, 10))
+        self.combo_place_at.pack(side="left")
+        self.combo_place_at.bind("<<ComboboxSelected>>",
+                                 lambda _e: self._on_place_position_change())
+        ttk.Label(footer, textvariable=self.var_place_example,
+                  style="Mono.TLabel").pack(side="left", padx=(18, 0))
+
+        self._refresh_stay_rows()
+        self._sync_place_panel()
 
     def _build_panel_insert(self, parent: ttk.Frame) -> ttk.Frame:
         panel = ttk.Frame(parent)
@@ -989,6 +1149,7 @@ class FotoRenamer:
             find=self.var_find.get(),
             replace_with=self.var_replace.get(),
             match_case=self.var_match_case.get(),
+            stays=tuple(self.stays),
             cleanup=CleanupOptions(lowercase=self.var_lower.get(),
                                     spaces_to_hyphens=self.var_spaces.get(),
                                     strip_accents=self.var_accents.get(),
@@ -1032,6 +1193,10 @@ class FotoRenamer:
                                    photo.name,
                                    plan.new_name if plan else "—",
                                    photo.date_display))
+
+        # The Place panel's example: the first ticked photo as it will come
+        # out. It costs nothing here because the plan is already built.
+        self.var_place_example.set(self.plans[0].new_name if self.plans else "")
 
         changing = [p for p in self.plans if p.changed]
         self.var_counts.set(f"{len(self.files)} files · {len(self.plans)} ticked")
@@ -1215,6 +1380,12 @@ class FotoRenamer:
         self.var_example.set(f"e.g.   {preset.example}")
         self.lbl_note.configure(text=preset.note)
 
+        # A preset overwrites the pattern, which would take {place} with it.
+        # Putting it straight back is what keeps the Position dropdown and
+        # the pattern box telling the same story.
+        if self.var_place_at.get() != PLACE_OFF:
+            self._apply_place_position()
+
         state = "normal" if preset.needs_event or is_custom else "disabled"
         self.entry_event.configure(state=state)
         for widget in (self.spin_start, self.spin_digits):
@@ -1234,6 +1405,167 @@ class FotoRenamer:
             self.spin_char.pack(side="left")
         else:
             self.lbl_which.configure(text="")
+        self.refresh_preview()
+
+    # -- the Place panel ---------------------------------------------------
+
+    @staticmethod
+    def _moment_text(date_var: tk.StringVar, time_var: tk.StringVar) -> str:
+        """Join the date box and the time box into one thing to parse.
+
+        An empty time box is left off entirely, which is what gives a bare
+        date its "the whole day" meaning in renamer.parse_stay.
+        """
+        date, time = date_var.get().strip(), time_var.get().strip()
+        return f"{date} {time}" if date and time else date
+
+    @staticmethod
+    def _format_stay(stay: renamer.Stay) -> str:
+        """How one row of the trip list reads: "15 Sep", "16 Sep – 20 Sep",
+        "18 Sep 13:00–18:00"."""
+        whole_day = ((stay.start.hour, stay.start.minute) == (0, 0)
+                     and (stay.end.hour, stay.end.minute) == (23, 59))
+        first = stay.start.strftime("%d %b").lstrip("0")
+        last = stay.end.strftime("%d %b").lstrip("0")
+        if whole_day:
+            return first if first == last else f"{first} – {last}"
+        if stay.start.date() == stay.end.date():
+            return f"{first} {stay.start:%H:%M}–{stay.end:%H:%M}"
+        return f"{first} {stay.start:%H:%M} – {last} {stay.end:%H:%M}"
+
+    def _refresh_stay_rows(self) -> None:
+        """Redraw the trip list. Row ids are the index into self.stays."""
+        self.stay_tree.delete(*self.stay_tree.get_children())
+        for index, stay in enumerate(self.stays):
+            self.stay_tree.insert("", "end", iid=str(index),
+                                  tags=(["stripe"] if index % 2 else []),
+                                  values=(self._format_stay(stay),
+                                          stay.place, "✕"))
+
+    def _add_stay(self) -> None:
+        try:
+            stay = renamer.parse_stay(
+                self._moment_text(self.var_from_date, self.var_from_time),
+                self._moment_text(self.var_to_date, self.var_to_time),
+                self.var_city.get())
+        except ValueError as exc:
+            # parse_stay writes its errors as sentences for exactly this line.
+            self.var_status.set(str(exc))
+            return
+
+        self.stays.append(stay)
+        self.stays.sort(key=lambda item: (item.start, item.end))
+        if stay.place not in self.cities:
+            self.cities.append(stay.place)
+            self.cities.sort(key=str.lower)
+            self.combo_city.configure(values=self.cities)
+        self._refresh_stay_rows()
+        self._sync_place_panel()
+        self.var_status.set(f"{stay.place}: {self._format_stay(stay)}.")
+
+        # A trip list the pattern never asks for would do nothing at all, so
+        # the first stay switches the token on. It lands in the pattern box
+        # where it can be seen, and Off puts it back.
+        if self.var_place_at.get() == PLACE_OFF:
+            self.var_place_at.set("End (suffix)")
+            self._apply_place_position()
+        self.refresh_preview()
+
+    def _on_stay_click(self, event) -> None:
+        if self.stay_tree.identify_region(event.x, event.y) != "cell":
+            return
+        if self.stay_tree.identify_column(event.x) != "#3":     # the ✕ column
+            return
+        iid = self.stay_tree.identify_row(event.y)
+        if not iid:
+            return
+        index = int(iid)
+        if 0 <= index < len(self.stays):
+            gone = self.stays.pop(index)
+            self._refresh_stay_rows()
+            self._sync_place_panel()
+            self.var_status.set(f"Removed {gone.place}.")
+            self.refresh_preview()
+
+    @staticmethod
+    def _pattern_without_place(pattern: str) -> str:
+        """The pattern with {place} and its leftover separator taken out."""
+        out = re.sub(r"\{place\}[_-]?", "", pattern)
+        out = re.sub(r"[_-]\{place\}", "", out)
+        return out.strip("_-")
+
+    def _apply_place_position(self) -> None:
+        """Rewrite the pattern so {place} sits where the dropdown says.
+
+        Rewriting the text rather than adding a placement mode is what keeps
+        the preview and the pattern box from ever disagreeing — and it reuses
+        the whole existing expansion path, so there is no new branch anywhere
+        in renamer.py.
+        """
+        base = self._pattern_without_place(self.var_pattern.get())
+        choice = self.var_place_at.get()
+        if choice == "After the date":
+            pattern, swapped = re.subn(r"(\{date8?\})", r"\1_{place}",
+                                       base, count=1)
+            if not swapped:              # no date token to sit after
+                pattern = f"{{place}}_{base}" if base else "{place}"
+        elif choice == "Beginning":
+            pattern = f"{{place}}_{base}" if base else "{place}"
+        elif choice == "End (suffix)":
+            pattern = f"{base}_{{place}}" if base else "{place}"
+        else:                            # Off
+            pattern = base
+        self.var_pattern.set(pattern)
+
+    def _toggle_place_panel(self) -> None:
+        self.var_place_open.set(not self.var_place_open.get())
+        self._sync_place_panel(resize=True)
+
+    def _sync_place_panel(self, *, resize: bool = False) -> None:
+        """Show or hide the panel, and say on the strip which it is.
+
+        resize=True is the click: the window grows by what the panel needs and
+        shrinks back when it closes, so the panel takes its room from the
+        screen rather than from the file list. It is left off when the window
+        is first built, where the saved geometry is already the right size.
+        """
+        opening = self.var_place_open.get()
+        if opening:
+            self.place_body.grid()
+            self.var_place_toggle.set("▾   Place")
+        else:
+            self.place_body.grid_remove()
+            count = len(self.stays)
+            trips = f"{count} trip{'s' if count != 1 else ''} set"
+            self.var_place_toggle.set(
+                f"▸   Place — {trips if count else 'name photos after where you were'}")
+        # An open panel needs a taller window than the app's usual floor, or
+        # the RENAME button ends up below the bottom edge.
+        self.root.minsize(1010, 860 if opening else 720)
+        if resize:
+            self._resize_for_place_panel(opening)
+
+    def _resize_for_place_panel(self, opening: bool) -> None:
+        try:
+            self.root.update_idletasks()
+            needed = self.place_body.winfo_reqheight() + 10
+            width, height = self.root.winfo_width(), self.root.winfo_height()
+            if opening:
+                # Remember what to go back to: on a short screen the growth
+                # is capped, and subtracting the full panel height on the way
+                # out would leave the window smaller than it started.
+                self._height_without_place = height
+                height = min(height + needed, self.root.winfo_screenheight() - 80)
+            elif self._height_without_place is not None:
+                height = self._height_without_place
+            else:
+                height = max(height - needed, self.root.minsize()[1])
+            self.root.geometry(f"{width}x{height}")
+        except tk.TclError:          # the window is going away
+            pass
+
+    def _on_place_position_change(self) -> None:
+        self._apply_place_position()
         self.refresh_preview()
 
     def _insert_token(self, token: str) -> None:

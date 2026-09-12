@@ -235,10 +235,17 @@ class TestStays(unittest.TestCase):
         self.assertEqual(stay.end, datetime(2026, 9, 15, 23, 59, 59))
         self.assertEqual(stay.place, "New York City")
 
-    def test_a_date_and_time_is_taken_literally(self):
+    def test_a_start_time_is_taken_literally(self):
         stay = renamer.parse_stay("2026-09-18 13:00", "2026-09-18 18:00", "Fenway Park")
-        self.assertEqual(stay.start, datetime(2026, 9, 18, 13, 0))
-        self.assertEqual(stay.end, datetime(2026, 9, 18, 18, 0))
+        self.assertEqual(stay.start, datetime(2026, 9, 18, 13, 0, 0))
+
+    def test_an_end_time_runs_through_the_end_of_its_minute(self):
+        """"To 18:00" includes the shot at 18:00:30 — and it lets the window
+        offer 23:59 as the end of a day without losing its last minute."""
+        stay = renamer.parse_stay("2026-09-18 13:00", "2026-09-18 18:00", "Fenway Park")
+        self.assertEqual(stay.end, datetime(2026, 9, 18, 18, 0, 59))
+        day = renamer.parse_stay("2026-09-18 00:00", "2026-09-18 23:59", "Boston")
+        self.assertEqual(day.end, datetime(2026, 9, 18, 23, 59, 59))
 
     def test_seconds_are_accepted_too(self):
         stay = renamer.parse_stay("2026-09-18 13:00:30", "2026-09-18 18:00:45", "Fenway")

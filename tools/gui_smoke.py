@@ -129,6 +129,32 @@ def main() -> int:
           sorted(p.name for p in photos.iterdir()) == originals,
           str(sorted(p.name for p in photos.iterdir())))
 
+    # The Place panel: declare one stay, and every photo inside it picks the
+    # city up on its own.
+    app.var_place_open.set(True)
+    app._sync_place_panel()
+    app.var_city.set("New York City")
+    app.var_from_date.set("2026-06-12")
+    app.var_to_date.set("2026-06-12")
+    app._add_stay()
+    pump(root)
+    check("adding a stay puts {place} in the pattern",
+          "{place}" in app.var_pattern.get(), app.var_pattern.get())
+    check("every photo in the stay is named after it",
+          all(p.new_name.endswith("_new-york-city.jpg") for p in app.plans),
+          str([p.new_name for p in app.plans]))
+    check("the panel's example line shows the first ticked photo",
+          app.var_place_example.get() == app.plans[0].new_name,
+          app.var_place_example.get())
+
+    app.var_place_at.set("Off")
+    app._on_place_position_change()
+    pump(root)
+    check("Position Off takes the token back out again",
+          "{place}" not in app.var_pattern.get()
+          and all("new-york-city" not in p.new_name for p in app.plans),
+          app.var_pattern.get())
+
     # A name long enough to break Windows must be capped, not attempted.
     app.var_event.set("x" * 300)
     pump(root)

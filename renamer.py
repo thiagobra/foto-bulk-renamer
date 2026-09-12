@@ -494,6 +494,10 @@ def _parse_moment(text: str, *, label: str, end_of_day: bool) -> datetime:
     A bare date means the whole day: from 00:00:00, through 23:59:59. That is
     what "I was there on the 15th" means, and it is the common case — the
     time boxes exist only for the afternoon you want to name separately.
+
+    An end given to the minute runs through the end of that minute, so "to
+    18:00" includes the shot taken at 18:00:30, and the window can offer
+    23:59 as the end of a day without quietly dropping its last minute.
     """
     text = (text or "").strip()
     if not text:
@@ -503,8 +507,11 @@ def _parse_moment(text: str, *, label: str, end_of_day: bool) -> datetime:
             moment = datetime.strptime(text, fmt)
         except ValueError:
             continue
-        if fmt == "%Y-%m-%d" and end_of_day:
-            return moment.replace(hour=23, minute=59, second=59)
+        if end_of_day:
+            if fmt == "%Y-%m-%d":
+                return moment.replace(hour=23, minute=59, second=59)
+            if fmt == "%Y-%m-%d %H:%M":
+                return moment.replace(second=59)
         return moment
     raise ValueError(f"{text} is not a date — use 2026-09-15")
 
