@@ -98,6 +98,70 @@ class TestTokens(unittest.TestCase):
         self.assertEqual(self.expand("{nope}_{n}"), "{nope}_014")
 
 
+class TestPlaceToken(unittest.TestCase):
+    """{place} is an ordinary token: it composes, it moves, it can be empty."""
+
+    def setUp(self):
+        self.photo = make_photo("IMG_20260612_142233", taken="2026-09-15 10:00:00")
+        self.stays = (renamer.parse_stay("2026-09-15", "2026-09-15", "New York City"),
+                      renamer.parse_stay("2026-09-16", "2026-09-20", "Boston"))
+
+    def name(self, pattern: str, photo=None) -> str:
+        settings = RenameSettings(pattern=pattern, event="lakeside wedding",
+                                  stays=self.stays)
+        return renamer.build_new_stem(photo or self.photo, settings, 7)
+
+    def test_place_at_the_end(self):
+        self.assertEqual(self.name("{date}_{event}_{n}_{place}"),
+                         "2026-09-15_lakeside-wedding_007_new-york-city")
+
+    def test_place_at_the_beginning(self):
+        self.assertEqual(self.name("{place}_{date}_{event}_{n}"),
+                         "new-york-city_2026-09-15_lakeside-wedding_007")
+
+    def test_place_in_the_middle(self):
+        self.assertEqual(self.name("{date}_{place}_{event}_{n}"),
+                         "2026-09-15_new-york-city_lakeside-wedding_007")
+
+    def test_a_photo_from_another_day_picks_up_its_own_place(self):
+        boston = make_photo("IMG_0002", taken="2026-09-17 08:00:00")
+        self.assertEqual(self.name("{date}_{place}_{n}", photo=boston),
+                         "2026-09-17_boston_007")
+
+    def test_a_photo_outside_every_stay_leaves_no_hole(self):
+        stray = make_photo("IMG_0003", taken="2026-09-22 08:00:00")
+        self.assertEqual(self.name("{date}_{event}_{n}_{place}", photo=stray),
+                         "2026-09-22_lakeside-wedding_007")
+
+    def test_an_empty_place_at_the_beginning_leaves_no_leading_separator(self):
+        stray = make_photo("IMG_0003", taken="2026-09-22 08:00:00")
+        self.assertEqual(self.name("{place}_{date}_{n}", photo=stray),
+                         "2026-09-22_007")
+
+    def test_no_stays_configured_renders_place_as_nothing(self):
+        settings = RenameSettings(pattern="{date}_{place}_{n}")
+        self.assertEqual(renamer.build_new_stem(self.photo, settings, 7),
+                         "2026-09-15_007")
+
+    def test_expand_pattern_still_works_without_the_new_argument(self):
+        """The default keeps every existing caller - and TestTokens - honest."""
+        self.assertEqual(
+            renamer.expand_pattern("{place}{date}", photo=self.photo,
+                                   event="", index=1, digits=3),
+            "2026-09-15")
+
+    def test_the_token_is_documented_for_the_chip_row(self):
+        self.assertIn("{place}", renamer.TOKEN_HELP)
+
+    def test_insert_mode_ignores_the_stay_list(self):
+        """Insert and Find & replace promise to leave the original name alone,
+        and that includes not quietly gaining a place."""
+        settings = RenameSettings(mode=Mode.INSERT, insert_text="praia",
+                                  stays=self.stays)
+        self.assertEqual(renamer.build_new_stem(self.photo, settings, 1),
+                         "praia_IMG_20260612_142233")
+
+
 class TestStays(unittest.TestCase):
     """parse_stay turns two text boxes into a period, or says why it cannot."""
 

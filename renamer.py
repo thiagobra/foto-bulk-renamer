@@ -367,6 +367,7 @@ TOKEN_HELP = {
     "{orig}": "the original file name, without extension",
     "{cam}": "last 4 digits of the original name (traces back to the camera)",
     "{n}": "sequence number, zero-padded to the Digits box",
+    "{place}": "where you were, from the trip list in the Place panel",
 }
 
 
@@ -383,9 +384,13 @@ def camera_id(stem: str, length: int = 4) -> str:
 
 
 def expand_pattern(pattern: str, *, photo: PhotoFile, event: str,
-                   index: int, digits: int) -> str:
+                   index: int, digits: int, place: str = "") -> str:
     """Replace every {token} in `pattern`. Unknown tokens are left alone
-    so a typo is visible in the preview instead of silently vanishing."""
+    so a typo is visible in the preview instead of silently vanishing.
+
+    `place` is already resolved by the caller (see build_new_stem): this
+    function stays a plain substitution and never looks at the stay list.
+    """
     values = {
         "date": photo.taken_at.strftime("%Y-%m-%d"),
         "date8": photo.taken_at.strftime("%Y%m%d"),
@@ -394,6 +399,9 @@ def expand_pattern(pattern: str, *, photo: PhotoFile, event: str,
         "orig": photo.stem,
         "cam": camera_id(photo.stem),
         "n": str(index).zfill(max(1, digits)),
+        # A photo outside every stay renders as "", and the collapse_separators
+        # cleanup then strips the "__" or trailing "_" it leaves behind.
+        "place": place,
     }
     return re.sub(r"\{(\w+)\}",
                   lambda m: values.get(m.group(1), m.group(0)),
@@ -513,6 +521,10 @@ class RenameSettings:
     find: str = ""
     replace_with: str = ""
     match_case: bool = False
+    # Where you were, for the {place} token. A tuple so RenameSettings stays
+    # cheap to build on every keystroke and nothing can mutate it behind the
+    # preview's back.
+    stays: tuple[Stay, ...] = ()
     # Shared
     cleanup: CleanupOptions = field(default_factory=CleanupOptions)
 
@@ -557,7 +569,8 @@ def build_new_stem(photo: PhotoFile, settings: RenameSettings, index: int) -> st
     if settings.mode is Mode.NEW_NAME:
         stem = expand_pattern(settings.pattern, photo=photo,
                               event=settings.event, index=index,
-                              digits=settings.digits)
+                              digits=settings.digits,
+                              place=place_for(photo.taken_at, settings.stays))
         stem = apply_cleanup(stem, settings.cleanup)
 
     elif settings.mode is Mode.INSERT:
