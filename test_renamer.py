@@ -929,9 +929,17 @@ class TestDerivedFieldsStayInStep(unittest.TestCase):
 
     def test_relocate_refreshes_the_resolved_path_and_the_sort_key(self):
         photo = make_photo("IMG_0001")
-        photo.relocate(Path("/tmp/2026-06-12_beach_001.jpg"))
+        was = photo.resolved
+
+        # Compare against resolve(), not the literal path: on Windows a
+        # rooted path with no drive letter resolves onto the current drive
+        # ("/tmp/x" -> "D:/tmp/x"), so a bare Path() could only ever match
+        # on POSIX.
+        new_path = Path("/tmp/2026-06-12_beach_001.jpg")
+        photo.relocate(new_path)
         self.assertEqual(photo.name, "2026-06-12_beach_001.jpg")
-        self.assertEqual(photo.resolved, Path("/tmp/2026-06-12_beach_001.jpg"))
+        self.assertNotEqual(photo.resolved, was)
+        self.assertEqual(photo.resolved, new_path.resolve())
         self.assertEqual(photo.sort_key[1], renamer.natural_key(photo.name))
 
     def test_the_cached_sort_key_still_sorts_naturally(self):
