@@ -83,6 +83,7 @@ def sc_presets_and_modes():
     fresh_fixtures()
     a = new_app()
     a.add_paths([str(FIX / "cardA")])
+    a.wait_for_dates()
     pump(a.root)
     check("scan found 6 supported files, skipped notes.txt",
           len(a.files) == 6, f"got {len(a.files)}: {[f.name for f in a.files]}")
@@ -142,6 +143,7 @@ def sc_rename_undo_restart():
     fresh_fixtures()
     a = new_app()
     a.add_paths([str(FIX / "cardA")])
+    a.wait_for_dates()
     a.var_event.set("praia"); pump(a.root)
     original = names(FIX / "cardA")
     a.do_rename(); pump(a.root)
@@ -164,7 +166,7 @@ def sc_rename_undo_restart():
     a.root.destroy()
 
     # rename again, kill the app, start a new one, undo from the log on disk
-    a = new_app(); a.add_paths([str(FIX / "cardA")])
+    a = new_app(); a.add_paths([str(FIX / "cardA")]); a.wait_for_dates()
     a.var_event.set("restart"); pump(a.root)
     a.do_rename(); pump(a.root)
     renamed = names(FIX / "cardA")
@@ -185,6 +187,7 @@ def sc_multifolder():
     fresh_fixtures()
     a = new_app()
     a.add_paths([str(FIX / "cardA"), str(FIX / "cardB")])
+    a.wait_for_dates()
     pump(a.root)
     check("both folders loaded", len(a.files) == 8, len(a.files))
     a.var_event.set("trip"); pump(a.root)
@@ -214,6 +217,7 @@ def sc_deleted_midbatch():
     fresh_fixtures()
     a = new_app()
     a.add_paths([str(FIX / "cardA")])
+    a.wait_for_dates()
     a.var_event.set("gone"); pump(a.root)
     victim = FIX / "cardA" / "IMG_0003.JPG"
     victim.unlink()                      # vanishes AFTER the preview was built
@@ -237,7 +241,7 @@ def sc_locked_file():
     lock = FIX / "locked"; lock.mkdir()
     shutil.copy(FIX / "cardA" / "IMG_0001.JPG", lock / "IMG_0001.JPG")
     shutil.copy(FIX / "cardA" / "IMG_0003.JPG", lock / "IMG_0003.JPG")
-    a = new_app(); a.add_paths([str(lock)])
+    a = new_app(); a.add_paths([str(lock)]); a.wait_for_dates()
     a.var_event.set("locked"); pump(a.root)
 
     # We run as root here, so chmod cannot block a rename. Make the OS refuse
@@ -274,8 +278,8 @@ def sc_thumbnail_and_selection():
     wipe_settings()
     print("\n[6] thumbnail pane + row selection + keyboard")
     fresh_fixtures()
-    a = new_app(); a.add_paths([str(FIX / "cardA")]); a.var_event.set("praia")
-    pump(a.root)
+    a = new_app(); a.add_paths([str(FIX / "cardA")]); a.wait_for_dates()
+    a.var_event.set("praia"); pump(a.root)
     a.tree.selection_set("0"); a._show_thumbnail()
     for _ in range(40):
         pump(a.root); a._poll_thumbnails()
@@ -312,7 +316,7 @@ def sc_long_name():
     wipe_settings()
     print("\n[8] a very long event name (Windows MAX_PATH territory)")
     fresh_fixtures()
-    a = new_app(); a.add_paths([str(FIX / "cardA" / "IMG_0001.JPG")])
+    a = new_app(); a.add_paths([str(FIX / "cardA" / "IMG_0001.JPG")]); a.wait_for_dates()
     a.var_event.set("x" * 300); pump(a.root)
     plan = a.plans[0]
     full = len(str(plan.target))
@@ -343,7 +347,7 @@ def sc_heic():
     except Exception as e:
         heic.write_bytes(b"\x00" * 128); made = False
         print("    (could not synthesise a real HEIC:", e, ")")
-    a = new_app(); a.add_paths([str(heic)]); pump(a.root)
+    a = new_app(); a.add_paths([str(heic)]); a.wait_for_dates(); pump(a.root)
     check("a .heic file is accepted into the list", len(a.files) == 1, len(a.files))
     if made:
         check("the HEIC capture date is read, not silently faked as the file date",
@@ -363,6 +367,7 @@ def sc_screenshots(outdir):
     a = new_app()
     a.root.geometry("1200x950+0+0")
     a.add_paths([str(FIX / "cardA"), str(FIX / "cardB")])
+    a.wait_for_dates()
     a.var_event.set("lakeside wedding"); a.tree.selection_set("0")
     a._show_thumbnail()
     for _ in range(40): pump(a.root); a._poll_thumbnails()

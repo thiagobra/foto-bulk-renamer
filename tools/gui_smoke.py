@@ -80,6 +80,7 @@ def main() -> int:
     check("the window builds without error", root.winfo_exists() == 1)
 
     app.add_paths([str(photos)])
+    app.wait_for_dates()
     pump(root)
     check("all three photos were picked up", len(app.files) == 3, str(len(app.files)))
     check("EXIF capture dates were read, not file dates",

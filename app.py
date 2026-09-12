@@ -18,6 +18,7 @@ import queue
 import re
 import sys
 import threading
+import time
 import tkinter as tk
 import tkinter.font as tkfont
 from pathlib import Path
@@ -199,6 +200,15 @@ class FotoRenamer:
         self._thumb_token = 0
         self._thumb_queue: queue.Queue = queue.Queue()
         self._thumb_image: ImageTk.PhotoImage | None = None
+        # EXIF backfill: reading capture dates is the slow half of scanning,
+        # so it runs on a worker thread. _exif_total > 0 means one is in
+        # flight, which is what disables RENAME.
+        self._exif_token = 0
+        self._exif_queue: queue.Queue = queue.Queue()
+        self._exif_done = 0
+        self._exif_total = 0
+        self._exif_read: set[Path] = set()       # resolved paths already tried
+        self._scan_note = ""                     # status line to put back after
         self._row_paths: list[Path] = []         # tree row order
 
         self.settings_file = renamer.app_data_dir() / "settings.json"
@@ -751,7 +761,10 @@ class FotoRenamer:
             self.add_paths(chosen)
 
     def add_paths(self, paths) -> None:
-        found, skipped = renamer.scan_paths(paths)
+        # read_exif=False keeps the slow part off the UI thread: the list
+        # appears at once with file dates, and _start_exif_backfill corrects
+        # them behind it.
+        found, skipped = renamer.scan_paths(paths, read_exif=False)
         known = {f.resolved for f in self.files}
         added = [f for f in found if f.resolved not in known]
         self.files = renamer.sort_files(self.files + added)
@@ -764,9 +777,90 @@ class FotoRenamer:
                                             for f in added):
             notes.append("HEIC dates fall back to the file date "
                          "(pip install pillow-heif to read them)")
-        self.var_status.set(" · ".join(notes))
+        self._scan_note = " · ".join(notes)
+        self.var_status.set(self._scan_note)
         self._populate_tree()
-        self.refresh_preview()
+        self._start_exif_backfill()        # before the preview, so RENAME
+        self.refresh_preview()             # is already showing as blocked
+
+    def _start_exif_backfill(self) -> None:
+        """Read the real capture dates on a worker thread.
+
+        Same shape as the thumbnail loader already in this file: a daemon
+        thread posts results to a queue, the 120 ms tick drains them on the UI
+        thread, and a token makes a newer scan supersede an older one. The
+        worker never touches a PhotoFile or a widget — it only reads paths and
+        posts values.
+
+        It sweeps every file whose date has not been read yet, not just the
+        ones just added: starting a new worker abandons the running one, so
+        whatever that one had not reached still needs reading. Drop a folder,
+        then drop a second one while the first is still going, and both end up
+        with real dates.
+        """
+        pending = [f for f in self.files if f.resolved not in self._exif_read]
+        self._exif_token += 1              # abandons any backfill still running
+        self._exif_done, self._exif_total = 0, len(pending)
+        if not pending:
+            return
+        threading.Thread(target=self._read_exif_dates,
+                         args=(pending, self._exif_token),
+                         daemon=True).start()
+
+    def _read_exif_dates(self, files, token: int) -> None:
+        """Runs off the UI thread; results are picked up by _drain_exif_queue."""
+        renamer.backfill_exif_dates(
+            files,
+            on_result=lambda photo, taken_at, from_exif:
+                self._exif_queue.put((token, photo, taken_at, from_exif)),
+            should_stop=lambda: token != self._exif_token)
+        self._exif_queue.put((token, None, None, False))     # finished marker
+
+    def _drain_exif_queue(self) -> None:
+        finished = False
+        try:
+            while True:
+                token, photo, taken_at, from_exif = self._exif_queue.get_nowait()
+                if token != self._exif_token:
+                    continue                 # a newer scan superseded this one
+                if photo is None:
+                    finished = True
+                    continue
+                self._exif_done += 1
+                self._exif_read.add(photo.resolved)
+                if from_exif and taken_at != photo.taken_at:
+                    photo.set_taken_at(taken_at, from_exif=True)
+        except queue.Empty:
+            pass
+
+        if finished:
+            self._exif_total = 0
+            # One reshuffle, at the end: the list settles into chronological
+            # order exactly once rather than jumping about as dates land.
+            self.files = renamer.sort_files(self.files)
+            self._populate_tree()
+            self.refresh_preview()            # also puts RENAME back
+            self.var_status.set(self._scan_note)
+        elif self._exif_total:
+            self.var_status.set(
+                f"reading dates… {self._exif_done}/{self._exif_total}")
+
+    def wait_for_dates(self, timeout: float = 60.0) -> bool:
+        """Pump the event loop until the EXIF backfill has finished.
+
+        Only the headless drive scripts in tools/ need this: they call
+        add_paths() and assert on the preview straight away, which the
+        threaded backfill would otherwise race. Returns False on timeout.
+        """
+        deadline = time.monotonic() + timeout
+        while self._exif_total:
+            if time.monotonic() > deadline:
+                return False
+            self.root.update_idletasks()
+            self.root.update()
+            self._drain_exif_queue()
+            time.sleep(0.005)
+        return True
 
     def remove_selected(self) -> None:
         doomed = [photo for photo in map(self._photo_for_row, self.tree.selection())
@@ -776,6 +870,8 @@ class FotoRenamer:
         # Untick before dropping them, while we still hold the PhotoFiles and
         # can read the resolved path they already worked out.
         self.checked -= {f.resolved for f in doomed}
+        # Forget that we read their dates, so re-adding one reads it again.
+        self._exif_read -= {f.resolved for f in doomed}
         gone = {f.path for f in doomed}
         self.files = [f for f in self.files if f.path not in gone]
         self.var_status.set(f"{len(gone)} removed from the list")
@@ -784,6 +880,9 @@ class FotoRenamer:
 
     def clear_list(self) -> None:
         self.files, self.checked = [], set()
+        self._exif_read.clear()
+        self._exif_token += 1              # abandon any backfill still running
+        self._exif_done = self._exif_total = 0
         self.var_status.set("List cleared.")
         self._populate_tree()
         self.refresh_preview()
@@ -925,10 +1024,17 @@ class FotoRenamer:
 
         changing = [p for p in self.plans if p.changed]
         self.var_counts.set(f"{len(self.files)} files · {len(self.plans)} ticked")
-        self.var_rename_button.set(
-            f"RENAME {len(changing)} FILE{'S' if len(changing) != 1 else ''}"
-            if changing else "RENAME")
-        self.button_rename.state(["!disabled"] if changing else ["disabled"])
+        if self._exif_total:
+            # The numbers follow capture order, so committing before every
+            # date is in could hand out a sequence the finished list would
+            # never produce. Loading stays instant; only the commit waits.
+            self.var_rename_button.set("reading dates…")
+            self.button_rename.state(["disabled"])
+        else:
+            self.var_rename_button.set(
+                f"RENAME {len(changing)} FILE{'S' if len(changing) != 1 else ''}"
+                if changing else "RENAME")
+            self.button_rename.state(["!disabled"] if changing else ["disabled"])
         self._update_hint()
         self._update_preview_labels()
 
@@ -1023,6 +1129,16 @@ class FotoRenamer:
             self._thumb_queue.put((token, None))
 
     def _poll_thumbnails(self) -> None:
+        """The app's single 120 ms tick, draining both background workers.
+
+        Kept under its original name because tools/gui_drive_full.py pumps it
+        by hand in several places.
+        """
+        self._drain_thumbnail_queue()
+        self._drain_exif_queue()
+        self.root.after(120, self._poll_thumbnails)
+
+    def _drain_thumbnail_queue(self) -> None:
         try:
             while True:
                 token, image = self._thumb_queue.get_nowait()
@@ -1038,7 +1154,6 @@ class FotoRenamer:
                                                    image=self._thumb_image)
         except queue.Empty:
             pass
-        self.root.after(120, self._poll_thumbnails)
 
     # -- reacting to the controls -------------------------------------------
 

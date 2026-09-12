@@ -231,6 +231,44 @@ def scan_paths(paths, *, read_exif: bool = True) -> tuple[list[PhotoFile], int]:
     return files, skipped
 
 
+def backfill_exif_dates(files, *, on_result, should_stop=None) -> int:
+    """Read the real capture dates for files scanned with read_exif=False.
+
+    This is the slow half of scanning — Pillow has to open every image — and
+    on a couple of thousand photos it is what freezes the window. So it lives
+    here, in the GUI-free core, and knows nothing about threads: the caller
+    decides what to run it on and what on_result does with each answer. That
+    is what makes it testable without opening a window.
+
+    on_result(photo, taken_at, from_exif) is called once per file, in order,
+    including for files that turn out to have no EXIF date at all — the caller
+    needs those to show honest progress. It must not mutate `photo` itself if
+    it is running off the UI thread; hand the values across and apply them
+    there.
+
+    should_stop() is polled between files, so a newer scan can abandon this
+    one. Returns how many files it got through.
+    """
+    done = 0
+    for photo in files:
+        if should_stop is not None and should_stop():
+            return done
+        if photo.ext.lower() not in IMAGE_EXTS:
+            # A video has no EXIF; the modified time it already has is all
+            # there is. Say so rather than paying to find out again.
+            on_result(photo, photo.taken_at, photo.from_exif)
+        else:
+            try:
+                taken_at, from_exif = read_taken_at(photo.path)
+            except OSError:
+                # Unplugged or deleted since the scan. The date it already
+                # has stands, and the rename will report the failure.
+                taken_at, from_exif = photo.taken_at, photo.from_exif
+            on_result(photo, taken_at, from_exif)
+        done += 1
+    return done
+
+
 def sort_files(files: list[PhotoFile]) -> list[PhotoFile]:
     """Chronological order, falling back to Explorer-style name order."""
     return sorted(files, key=lambda f: f.sort_key)

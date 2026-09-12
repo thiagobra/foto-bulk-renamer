@@ -912,5 +912,122 @@ class TestPreviewTouchesNoDisk(unittest.TestCase):
         self.assertEqual(calls["resolve"], 1)
 
 
+class TestDerivedFieldsStayInStep(unittest.TestCase):
+    """PhotoFile caches three derived values. A cache that can go stale
+    silently is worse than no cache, so the two things that can invalidate
+    them have to refresh all three."""
+
+    def test_set_taken_at_refreshes_the_display_and_the_sort_key(self):
+        photo = make_photo("IMG_0001", taken="2026-06-12 14:22:33")
+        self.assertEqual(photo.date_display, "12 Jun 2026 14:22")
+
+        photo.set_taken_at(datetime(2024, 1, 2, 3, 4, 5), from_exif=True)
+        self.assertEqual(photo.taken_at, datetime(2024, 1, 2, 3, 4, 5))
+        self.assertTrue(photo.from_exif)
+        self.assertEqual(photo.date_display, "02 Jan 2024 03:04")
+        self.assertEqual(photo.sort_key[0], datetime(2024, 1, 2, 3, 4, 5))
+
+    def test_relocate_refreshes_the_resolved_path_and_the_sort_key(self):
+        photo = make_photo("IMG_0001")
+        photo.relocate(Path("/tmp/2026-06-12_beach_001.jpg"))
+        self.assertEqual(photo.name, "2026-06-12_beach_001.jpg")
+        self.assertEqual(photo.resolved, Path("/tmp/2026-06-12_beach_001.jpg"))
+        self.assertEqual(photo.sort_key[1], renamer.natural_key(photo.name))
+
+    def test_the_cached_sort_key_still_sorts_naturally(self):
+        files = [make_photo(f"IMG_{n}", taken="2026-06-12 14:22:33")
+                 for n in (10, 9, 2)]
+        self.assertEqual([f.name for f in renamer.sort_files(files)],
+                         ["IMG_2.jpg", "IMG_9.jpg", "IMG_10.jpg"])
+
+
+class TestExifBackfill(unittest.TestCase):
+    """scan_paths(read_exif=False) is deliberately half a scan: it is what
+    lets a 2,000-photo drop appear instantly. backfill_exif_dates is the other
+    half, and the GUI runs it on a worker thread."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_skipping_exif_falls_back_to_the_file_date(self):
+        write_jpeg(self.dir / "IMG_0001.jpg", exif_date="2026:06:12 14:22:33")
+        files, _ = renamer.scan_paths([self.dir], read_exif=False)
+        self.assertFalse(files[0].from_exif)
+        self.assertNotEqual(files[0].taken_at, datetime(2026, 6, 12, 14, 22, 33))
+
+    def test_the_backfill_finds_the_date_the_fast_scan_skipped(self):
+        write_jpeg(self.dir / "IMG_0001.jpg", exif_date="2026:06:12 14:22:33")
+        files, _ = renamer.scan_paths([self.dir], read_exif=False)
+
+        results = []
+        renamer.backfill_exif_dates(files, on_result=lambda *r: results.append(r))
+        self.assertEqual(len(results), 1)
+
+        photo, taken_at, from_exif = results[0]
+        self.assertTrue(from_exif)
+        # The worker hands values across; only the caller applies them.
+        self.assertFalse(photo.from_exif)
+        photo.set_taken_at(taken_at, from_exif=from_exif)
+        self.assertEqual(photo.taken_at, datetime(2026, 6, 12, 14, 22, 33))
+        self.assertEqual(photo.date_display, "12 Jun 2026 14:22")
+        self.assertEqual(photo.sort_key[0], datetime(2026, 6, 12, 14, 22, 33))
+
+    def test_every_file_is_reported_so_progress_can_be_honest(self):
+        for i in (1, 2, 3):
+            write_jpeg(self.dir / f"IMG_000{i}.jpg")      # no EXIF at all
+        files, _ = renamer.scan_paths([self.dir], read_exif=False)
+        results = []
+        done = renamer.backfill_exif_dates(
+            files, on_result=lambda *r: results.append(r))
+        self.assertEqual(done, 3)
+        self.assertEqual(len(results), 3)
+        self.assertFalse(any(from_exif for _, _, from_exif in results))
+
+    def test_should_stop_abandons_the_rest(self):
+        for i in (1, 2, 3, 4):
+            write_jpeg(self.dir / f"IMG_000{i}.jpg")
+        files = renamer.sort_files(renamer.scan_paths([self.dir], read_exif=False)[0])
+        results = []
+        done = renamer.backfill_exif_dates(
+            files,
+            on_result=lambda *r: results.append(r),
+            should_stop=lambda: len(results) >= 2)
+        self.assertEqual((done, len(results)), (2, 2))
+
+    def test_a_video_is_reported_without_being_opened(self):
+        """Videos carry no EXIF, so re-reading them would be pure waste."""
+        (self.dir / "clip.mp4").write_bytes(b"not really a video")
+        files, _ = renamer.scan_paths([self.dir], read_exif=False)
+        scanned_date = files[0].taken_at
+
+        opened = []
+        real_read = renamer.read_taken_at
+        renamer.read_taken_at = lambda *a, **k: opened.append(1) or real_read(*a, **k)
+        try:
+            results = []
+            renamer.backfill_exif_dates(files, on_result=lambda *r: results.append(r))
+        finally:
+            renamer.read_taken_at = real_read
+
+        self.assertEqual(opened, [], "a video was re-read for EXIF it cannot have")
+        self.assertEqual(results[0][1], scanned_date)
+
+    def test_a_file_deleted_mid_backfill_keeps_the_date_it_had(self):
+        write_jpeg(self.dir / "IMG_0001.jpg", exif_date="2026:06:12 14:22:33")
+        files, _ = renamer.scan_paths([self.dir], read_exif=False)
+        scanned_date = files[0].taken_at
+        (self.dir / "IMG_0001.jpg").unlink()          # card pulled out
+
+        results = []
+        done = renamer.backfill_exif_dates(
+            files, on_result=lambda *r: results.append(r))
+        self.assertEqual(done, 1)
+        self.assertEqual(results[0][1], scanned_date)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
