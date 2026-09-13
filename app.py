@@ -406,23 +406,40 @@ class FotoRenamer:
         stays.sort(key=lambda stay: (stay.start, stay.end))
         return stays
 
-    def _onscreen_geometry(self, geometry) -> str | None:
-        """Drop a saved position that would open the window off-screen.
+    def _fit_to_screen(self, width: int, height: int) -> str:
+        """A saved size, never larger than the screen it is about to open on."""
+        return (f"{min(width, self.root.winfo_screenwidth())}"
+                f"x{min(height, self.root.winfo_screenheight())}")
 
-        Windows users unplug the second monitor the app was last on. Without
-        this the window reopens at coordinates nobody can reach.
+    def _onscreen_geometry(self, geometry) -> str | None:
+        """Drop a saved position that would open the window off-screen, and a
+        saved size too big for the screen it is opening on.
+
+        Windows users unplug the second monitor the app was last on, and they
+        move a 4K desktop's settings onto a laptop panel. Without this the
+        window reopens at coordinates nobody can reach, or at a size that puts
+        the RENAME button past the bottom edge.
         """
         if not isinstance(geometry, str):
             return None
-        match = re.fullmatch(r"(\d+)x(\d+)([+-]\d+)([+-]\d+)", geometry.strip())
+        # Tk writes a negative offset as "+-900", not "-900", and that is the
+        # exact string _save_settings stores. A pattern that cannot match it
+        # threw away the saved *size* as well, on every launch, forever.
+        match = re.fullmatch(r"(\d+)x(\d+)([+-]-?\d+)([+-]-?\d+)", geometry.strip())
         if not match:
-            return geometry if re.fullmatch(r"\d+x\d+", geometry.strip()) else None
-        width, height, x, y = (int(g) for g in match.groups())
+            size = re.fullmatch(r"(\d+)x(\d+)", geometry.strip())
+            return self._fit_to_screen(*(int(g) for g in size.groups())) if size else None
+        _w_text, _h_text, x_text, y_text = match.groups()
+        width, height, x, y = (int(g.lstrip("+")) for g in match.groups())
         screen_w, screen_h = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        size = self._fit_to_screen(width, height)
         # Keep the title bar reachable: at least 120x40 px of it must be visible.
         if -width + 120 <= x <= screen_w - 120 and 0 <= y <= screen_h - 40:
-            return geometry
-        return f"{width}x{height}"
+            # Hand the offsets back as Tk spelled them: "-50" means "from the
+            # right edge", which is not what rebuilding them from the number
+            # would produce.
+            return geometry if size == f"{width}x{height}" else f"{size}{x_text}{y_text}"
+        return size
 
     def _save_settings(self) -> None:
         data = {

@@ -334,6 +334,47 @@ def sc_broken_settings():
         a.root.destroy()
     wipe_settings()
 
+def sc_saved_geometry():
+    """A saved window position and size, read back on a different screen.
+
+    _save_settings stores winfo_geometry() verbatim, and Tk spells a negative
+    offset "+-50" — so the guard has to read its own app's output, and has to
+    check the size as well as the position.
+    """
+    wipe_settings()
+    print("\n[14] a saved geometry that no longer fits the screen")
+    a = new_app()
+    screen_w, screen_h = a.root.winfo_screenwidth(), a.root.winfo_screenheight()
+
+    def size_of(geometry):
+        return tuple(int(n) for n in geometry.split("+")[0].split("x"))
+
+    got = a._onscreen_geometry("900x700+-50+10")
+    check("a window just off the left edge keeps its saved size",
+          got is not None and size_of(got) == (900, 700), repr(got))
+
+    got = a._onscreen_geometry("3800x2100+0+0")
+    check("a 4K geometry on a smaller screen is clamped to the screen",
+          got is not None and size_of(got) <= (screen_w, screen_h), repr(got))
+
+    got = a._onscreen_geometry("1200x950+-1200+-900")
+    check("a genuinely off-screen position is dropped, size kept",
+          got == "1200x950", repr(got))
+
+    got = a._onscreen_geometry("4000x3000")
+    check("a bare size too big for the screen is clamped too",
+          got is not None and size_of(got) <= (screen_w, screen_h), repr(got))
+
+    # The round trip the app itself performs: save, reopen, still that size.
+    # 1100x900 is above the window's 1010x720 minimum, so anything else that
+    # comes back is the guard throwing the size away, not Tk enforcing minsize.
+    a.root.geometry("1100x900+-50+10"); pump(a.root); a._on_close()
+    b = new_app()
+    check("the size survives a restart from a negative saved offset",
+          size_of(b.root.geometry()) == (1100, 900), b.root.geometry())
+    b.root.destroy()
+    wipe_settings()
+
 def sc_long_name():
     wipe_settings()
     print("\n[8] a very long event name (Windows MAX_PATH territory)")
@@ -788,7 +829,8 @@ if __name__ == "__main__":
     todo = [sc_presets_and_modes, sc_rename_undo_restart, sc_multifolder,
             sc_deleted_midbatch, sc_locked_file, sc_thumbnail_and_selection,
             sc_settings_persist, sc_long_name, sc_heic, sc_metadata_dates,
-            sc_place_panel, sc_token_strip, sc_broken_settings]
+            sc_place_panel, sc_token_strip, sc_broken_settings,
+            sc_saved_geometry]
     if only == "shots":
         sc_screenshots(out)
     else:
