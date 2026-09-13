@@ -651,6 +651,45 @@ class TestFindReplace(unittest.TestCase):
                          "lakeside-wedding_20260612_142233")
 
 
+class TestReplacementIsLiteralText(unittest.TestCase):
+    """The Replace box is text the user typed, never a regex template.
+
+    The case-insensitive branch goes through re.sub, so a bare string
+    replacement would read "\\1" as a group reference (an error) and "\\g<0>"
+    as the whole match. Match case uses str.replace, which is literal — the
+    two must agree, because that switch is about *matching*, nothing else.
+    """
+
+    # Every backslash is dropped by sanitize_stem, so the expected text is
+    # what is left once the illegal character goes.
+    CASES = {
+        "\\1": "1",
+        "\\": "",
+        "\\g<0>": "g0",
+        "\\x": "x",
+        "a\\3b": "a3b",
+    }
+
+    def build(self, replacement: str, *, match_case: bool) -> str:
+        settings = RenameSettings(mode=Mode.REPLACE, find="IMG",
+                                  replace_with=replacement,
+                                  match_case=match_case)
+        return renamer.build_new_stem(make_photo("IMG_20260612_142233"),
+                                      settings, 1)
+
+    def test_a_backslash_replacement_is_inserted_verbatim(self):
+        for typed, expected in self.CASES.items():
+            with self.subTest(typed=typed):
+                self.assertEqual(self.build(typed, match_case=False),
+                                 f"{expected}_20260612_142233")
+
+    def test_match_case_does_not_change_what_a_replacement_means(self):
+        for typed in self.CASES:
+            with self.subTest(typed=typed):
+                self.assertEqual(self.build(typed, match_case=False),
+                                 self.build(typed, match_case=True))
+
+
 class TestPresets(unittest.TestCase):
     """Every shipped preset, against one fixed sample photo."""
 

@@ -904,7 +904,12 @@ def build_new_stem(photo: PhotoFile, settings: RenameSettings, index: int) -> st
         elif settings.match_case:
             stem = photo.stem.replace(settings.find, replacement)
         else:
-            stem = re.sub(re.escape(settings.find), replacement,
+            # A function replacement, not a string: re would otherwise read the
+            # Replace box as a template, so "\1" raises and "\g<0>" silently
+            # inserts the match. The Match case branch above uses str.replace,
+            # which is literal — a switch that only affects *matching* must not
+            # change what the replacement means. Do not "simplify" this back.
+            stem = re.sub(re.escape(settings.find), lambda _m: replacement,
                           photo.stem, flags=re.IGNORECASE)
 
     return sanitize_stem(stem)
