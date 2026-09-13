@@ -1357,13 +1357,28 @@ def undo_last() -> RenameResult:
 
     try:
         data = json.loads(log_path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            # Valid JSON of the wrong shape — "null", a bare list — would
+            # raise on .get() below. Give it the same fate as broken syntax.
+            raise ValueError("the undo record is not an object")
     except (OSError, ValueError):
         # A truncated or hand-edited log is useless; retire it rather than
         # failing forever on the same file.
         _retire_log(log_path)
         return RenameResult(errors=[("", "The undo record is unreadable — skipped.")])
 
-    pairs = [p for p in data.get("pairs", []) if isinstance(p, list) and len(p) == 2]
+    # Both elements have to be strings as well as present: Path(1) raises, and
+    # a log that raises can never be retired, so Undo would fail forever.
+    stored = data.get("pairs")
+    pairs = [p for p in (stored if isinstance(stored, list) else [])
+             if isinstance(p, list) and len(p) == 2
+             and all(isinstance(name, str) for name in p)]
+    if not pairs:
+        # A log is only ever written with moves in it, so an empty list means
+        # every entry was the wrong shape. Retiring it is the honest answer:
+        # otherwise Undo reports "0 files restored" on this file forever.
+        _retire_log(log_path)
+        return RenameResult(errors=[("", "The undo record is unreadable — skipped.")])
     moves: list[tuple[Path, Path]] = []
     result = RenameResult()
     for old_str, new_str in pairs:

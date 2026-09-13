@@ -1223,6 +1223,22 @@ class TestUndoDurability(unittest.TestCase):
         self.assertIn("unreadable", outcome.errors[0][1])
         self.assertIsNone(renamer.last_log())
 
+    def test_valid_json_of_the_wrong_shape_is_retired_too(self):
+        """json.loads only catches bad *syntax*. A log that is readable JSON
+        but not a list of [old, new] string pairs used to raise on every press,
+        and because it was never retired, Undo stayed broken forever."""
+        for garbage in ("null", "[]", "42", '{"pairs": null}',
+                        '{"pairs": [[1, 2]]}', '{"pairs": [["a"]]}',
+                        '{"pairs": ["a"]}', '{"pairs": []}'):
+            with self.subTest(garbage=garbage):
+                for spent in renamer.history_dir().glob("*.json*"):
+                    spent.unlink()
+                self._rename_one()
+                renamer.last_log().write_text(garbage, encoding="utf-8")
+                outcome = renamer.undo_last()          # must not raise
+                self.assertIn("unreadable", outcome.errors[0][1])
+                self.assertIsNone(renamer.last_log())  # and never seen again
+
 
 class TestHeicSupport(unittest.TestCase):
     """HEIC is advertised as supported, so the code must be honest about what
