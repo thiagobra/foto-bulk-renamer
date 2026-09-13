@@ -352,6 +352,13 @@ class FotoRenamer:
         for key, var in mapping.items():
             if isinstance(data.get(key), str):
                 var.set(data[key])
+        # "mode" is the one saved string that reaches an Enum (Mode(...)) and a
+        # bare dict lookup, so a value neither of them knows would take the
+        # window down during __init__, before it is ever shown. The radio
+        # buttons can only write Mode.*.value, so the file is the only
+        # untrusted writer and this is the only place that needs to check.
+        if self.var_mode.get() not in {m.value for m in Mode}:
+            self.var_mode.set(Mode.NEW_NAME.value)
         for key, var in (("match_case", self.var_match_case),
                          ("place_open", self.var_place_open),
                          ("lower", self.var_lower), ("spaces", self.var_spaces),

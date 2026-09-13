@@ -312,6 +312,28 @@ def sc_settings_persist():
           b.var_lower.get() is False, f"lower={b.var_lower.get()} accents={b.var_accents.get()}")
     b.root.destroy()
 
+def sc_broken_settings():
+    """A settings.json the app did not write must never stop it opening.
+
+    Every other saved field is type-checked on the way in; "mode" is the one
+    string that reaches an Enum and a bare dict lookup, both during __init__.
+    """
+    print("\n[13] a settings file the app did not write")
+    settings = renamer.app_data_dir() / "settings.json"
+    for bad in ('{"mode": "not_a_mode"}', '{"mode": ""}'):
+        wipe_settings()
+        settings.write_text(bad, encoding="utf-8")
+        try:
+            a = new_app()
+        except Exception as exc:
+            check(f"the window still opens with settings {bad}", False, repr(exc))
+            continue
+        check(f"the window still opens with settings {bad}", True)
+        check(f"an unknown mode falls back to New name  {bad}",
+              a.var_mode.get() == renamer.Mode.NEW_NAME.value, a.var_mode.get())
+        a.root.destroy()
+    wipe_settings()
+
 def sc_long_name():
     wipe_settings()
     print("\n[8] a very long event name (Windows MAX_PATH territory)")
@@ -741,7 +763,7 @@ if __name__ == "__main__":
     todo = [sc_presets_and_modes, sc_rename_undo_restart, sc_multifolder,
             sc_deleted_midbatch, sc_locked_file, sc_thumbnail_and_selection,
             sc_settings_persist, sc_long_name, sc_heic, sc_metadata_dates,
-            sc_place_panel, sc_token_strip]
+            sc_place_panel, sc_token_strip, sc_broken_settings]
     if only == "shots":
         sc_screenshots(out)
     else:
