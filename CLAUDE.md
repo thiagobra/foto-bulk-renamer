@@ -37,7 +37,7 @@ every new name before anything touches disk and a one-click undo.
 | `renamer.py` | **Pure core.** Scanning, EXIF dates, pattern expansion, collision planning, the two-phase rename, the undo log. Imports no `tkinter` — keep it that way. |
 | `app.py` | The Tk window. A shell over `renamer.py`; it should hold no naming logic. |
 | `presets.py` | Naming presets as plain frozen dataclasses. Adding one is a two-line edit. |
-| `test_renamer.py` | 164 unit tests over the core, no window needed. |
+| `test_renamer.py` | 181 unit tests over the core, no window needed. |
 | `tools/gui_smoke.py`, `tools/gui_drive_full.py` | Headless GUI drives. CI runs the first one. |
 | `tools/bench.py` | Times the live preview against the old approach. Not a test; CI ignores it. |
 
@@ -45,7 +45,7 @@ every new name before anything touches disk and a one-click undo.
 
 - **The core stays GUI-free.** Anything that can be tested without a window belongs in
   `renamer.py`.
-- **Never break the existing tests to make a change fit.** All 174 must stay green; if a
+- **Never break the existing tests to make a change fit.** All 181 must stay green; if a
   change needs a test edited, say so explicitly rather than quietly rewriting it.
 - **The GUI's design and layout are settled.** Do not restyle, re-lay-out or "improve" the
   interface unless asked. Internal wiring changes are fine.
@@ -74,9 +74,28 @@ every new name before anything touches disk and a one-click undo.
 
 ## Current work
 
-Nothing outstanding. The last planned round — the `{place}` token, the Place panel,
-the two capture-date fixes it depended on, and the scandir rewrite of the scan — is
-done and shipped. Its plan and measured outcomes were kept in `ARCHITECTURE_PLAN.md`,
+Nothing outstanding. The most recent round was an adversarial audit and the nine
+fixes that closed it; the findings, the repros and the commit that closed each are
+in `TEST.md`. Four invariants it left behind, all of them load-bearing:
+
+- **After phase 1 of `_two_phase_move`, every file in the batch is parked under a
+  temp name.** That is the whole reason phase 2 can treat a target that still
+  exists as a bystander and refuse it — no bookkeeping, just `dst.exists()`.
+  Anything that changes how phase 1 parks files has to revisit that guard.
+- **Text the user typed is never a regex template.** Find & replace passes a
+  *function* to `re.sub` so the Replace box is inserted verbatim, which is also
+  what keeps the Match case branch (`str.replace`, literal) in agreement with it.
+- **The Place Position dropdown reads its separator out of the pattern**, via
+  `_glue_beside` and `renamer.split_pattern` — the same rule as `reorder_tokens`.
+  Hardcoding `_` there silently rewrites a hyphenated pattern and the round trip
+  back to Off cannot restore it.
+- **A saved geometry is the app's own output, negative offsets included.** Tk
+  spells them `+-900`, so anything reading `settings.json`'s `geometry` has to
+  parse that spelling, and has to clamp the size to the screen it is opening on.
+
+Earlier rounds, oldest first. The `{place}` token, the Place panel, the two
+capture-date fixes it depended on, and the scandir rewrite of the scan — all
+done and shipped. That plan and its measured outcomes were kept in `ARCHITECTURE_PLAN.md`,
 now deleted as spent; read it at `git show 034f6e1:ARCHITECTURE_PLAN.md` if you ever
 need the reasoning.
 

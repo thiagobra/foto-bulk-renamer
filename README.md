@@ -227,10 +227,10 @@ thumbnailed — decoding raw needs a much heavier dependency than this app wants
 | `app.py` | The window — layout, theme, drag & drop, live preview. |
 | `renamer.py` | All the naming rules. No GUI code, so it can be tested on its own. |
 | `presets.py` | The preset table as plain data — add your own in two lines. |
-| `test_renamer.py` | 164 tests for the naming and disk rules. No window needed. |
+| `test_renamer.py` | 181 tests for the naming and disk rules. No window needed. |
 | `test_packaging.py` | 10 tests for the Windows-only files (CRLF, batch syntax, build flags). |
 | `tools/gui_smoke.py` | Opens the real window and drives it. What CI runs. |
-| `tools/gui_drive_full.py` | The long manual GUI sweep (109 checks) and the screenshot generator. |
+| `tools/gui_drive_full.py` | The long manual GUI sweep (122 checks) and the screenshot generator. |
 | `tools/bench.py` | Times the live preview, old approach against current. Not run by CI. |
 | `make_icon.py` | Regenerates `assets/icon.ico`. |
 | `run.bat` / `build_exe.bat` | Run from source / build the standalone exe. |
@@ -240,7 +240,7 @@ thumbnailed — decoding raw needs a much heavier dependency than this app wants
 ### Running the tests
 
 ```
-python -m unittest discover -v -p "test_*.py"     # 174 tests, no display needed
+python -m unittest discover -v -p "test_*.py"     # 181 tests, no display needed
 xvfb-run -a python tools/gui_smoke.py             # drives the real window (Linux)
 python tools\gui_smoke.py                         # the same, on Windows
 ```
@@ -278,6 +278,6 @@ was cleared.
 
 | | Where | Status |
 |---|---|---|
-| Logic — 174 unit tests | Windows **and** Linux, Python 3.10 and 3.12 | ✅ green on every push (CI). This includes the rules that only behave like Windows *on* Windows: the 260-character path cap, reserved names (`CON`, `NUL`), and case-only renames such as `IMG_0001.JPG` → `img_0001.jpg`. |
+| Logic — 181 unit tests | Windows **and** Linux, Python 3.10 and 3.12 | ✅ green on every push (CI). This includes the rules that only behave like Windows *on* Windows: the 260-character path cap, reserved names (`CON`, `NUL`), and case-only renames such as `IMG_0001.JPG` → `img_0001.jpg`. |
 | The real window | Linux, headless | ✅ green on every push (CI), plus an 83-check manual sweep via `tools/gui_drive_full.py` |
 | Windows **desktop** behaviour | a real Windows PC | ⚠️ **Not verified.** DPI awareness, the dark title bar, double-clicking `run.bat`, and the PyInstaller `.exe` cannot be exercised by a CI runner with no desktop session. They are reviewed against the Windows API docs and asserted where a file can be asserted (`test_packaging.py` checks the batch files' CRLF endings, block syntax and build flags), but nobody has yet double-clicked `run.bat` on Windows. That is the one remaining gap. |

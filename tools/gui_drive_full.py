@@ -6,7 +6,7 @@ long one you run by hand before a release, because it needs a display and
 takes longer. Nothing here is mocked: a real Tk window is created, real
 widgets are invoked, and the assertions look at the actual files on disk.
 
-    xvfb-run -a python tools/gui_drive_full.py all      # 109 checks
+    xvfb-run -a python tools/gui_drive_full.py all      # 122 checks
     xvfb-run -a python tools/gui_drive_full.py shots screenshots
 """
 import os, sys, json, shutil, subprocess, tempfile, traceback

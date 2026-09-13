@@ -1,6 +1,8 @@
 # Audit — foto-renamer-jua
 
-Adversarial bug hunt, 2026-09-12, python3.12 on Linux (xvfb). No fixes applied.
+Adversarial bug hunt, 2026-09-12, python3.12 on Linux (xvfb). Recorded here with
+no fixes applied; all nine were closed in the round that followed — see
+**Status** below. Kept as the record of what was wrong and how it was found.
 
 ## The three suites first
 
@@ -20,6 +22,31 @@ No failures. Two harmless count differences, reported for completeness:
   `ModuleNotFoundError: No module named 'PIL'` — 11 tests ran instead of 174.
 - **110 checks, not 109.** One more assertion than the docstring in
   `tools/gui_drive_full.py:9` and `CLAUDE.md` claim. All pass; the comment is stale.
+
+## Status — all nine closed
+
+Each fix carries the regression test that stops it coming back: the five core
+findings in `test_renamer.py`, the four window ones in `tools/gui_drive_full.py`.
+Every one of these tests was checked against the unfixed code first, and fails
+there.
+
+| # | What it was | Closed by | Caught by |
+|---|---|---|---|
+| 1 | Replace box read as a regex template | `c8148d2` | `TestReplacementIsLiteralText` |
+| 2 | Undo overwrites a reoccupied old name | `f44b999` | `TestABystanderIsNeverOverwritten` |
+| 3 | A bystander at the target is destroyed | `f44b999` | `TestABystanderIsNeverOverwritten` |
+| 4 | A corrupt `mode` stops the window opening | `898d379` | `sc_broken_settings` |
+| 5 | A wrong-shaped undo log crashes forever | `e9db036` | `test_valid_json_of_the_wrong_shape_is_retired_too` |
+| 6 | `DEDUPE_ROOM` one character short | `dc24835` | `test_a_thousand_collisions_still_fit_inside_the_path_budget` |
+| 7 | Position dropdown destroys a separator | `ca8d984` | `sc_place_panel` (hyphen round trip) |
+| 8 | Tk's own `+-N` geometry rejected | `c0a68f2` | `sc_saved_geometry` |
+| 9 | Saved size never checked against the screen | `c0a68f2` | `sc_saved_geometry` |
+
+Findings 2 and 3 are one guard: after phase 1 every file in the batch is parked
+under a temp name, so a target that still exists cannot be one of ours.
+
+The two count differences noted above are fixed as well — `CLAUDE.md`, `README.md`
+and the `gui_drive_full.py` docstring now say 181 tests and 122 checks.
 
 ## Defects
 
