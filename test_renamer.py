@@ -1030,6 +1030,57 @@ class TestWindowsPathLimit(unittest.TestCase):
             self.assertLessEqual(len(str(plan.target)), renamer.MAX_PATH_USABLE)
         self.assertTrue(any(p.conflict for p in plans))
 
+    def test_a_thousand_collisions_still_fit_inside_the_path_budget(self):
+        """DEDUPE_ROOM reserved six characters, enough for " (999)". The
+        thousandth collision needs " (1000)", which pushed the path one
+        character over Windows' limit — flagged `truncated` (cosmetic) rather
+        than `too_long` (refused), so the rename went ahead and the OS failed
+        it halfway through the batch."""
+        deep = self.dir / ("deep" * 10) / ("nested" * 8)
+        deep.mkdir(parents=True)
+        files = [PhotoFile(path=deep / f"src{i:05d}.jpg",
+                           taken_at=datetime(2026, 6, 12, 14, 22, 33), size=1)
+                 for i in range(1100)]
+        for photo in files:
+            photo.path.write_bytes(b"x")
+
+        # One pattern with no {n} in it, so all 1100 want the identical name.
+        plans = renamer.plan_renames(
+            files, RenameSettings(pattern="{event}", event="y" * 300))
+
+        self.assertTrue(any(p.conflict for p in plans))
+        for plan in plans:
+            with self.subTest(name=plan.new_name[-12:]):
+                self.assertTrue(
+                    len(str(plan.target)) <= renamer.MAX_PATH_USABLE or plan.too_long,
+                    f"{len(str(plan.target))} chars, unflagged: {plan.new_name}")
+
+    def test_a_suffix_that_cannot_fit_is_refused_rather_than_renamed(self):
+        """The head-room is a fixed number, so it can always be outgrown — at
+        " (10000)", or with a narrower DEDUPE_ROOM. The planner must check the
+        *finished* name, not the pre-dedupe stem."""
+        for index in range(3):
+            write_jpeg(self.dir / f"IMG_{index}.jpg", exif_date="2026:06:12 14:22:33")
+        files = renamer.sort_files(renamer.scan_paths([self.dir])[0])
+
+        room = renamer.DEDUPE_ROOM
+        renamer.DEDUPE_ROOM = 0          # no head-room at all: any suffix spills
+        try:
+            plans = renamer.plan_renames(
+                files, RenameSettings(pattern="{date}_" + "y" * 300))
+        finally:
+            renamer.DEDUPE_ROOM = room
+
+        spilled = [p for p in plans if len(str(p.target)) > renamer.MAX_PATH_USABLE]
+        self.assertTrue(spilled, "expected the suffix to overrun the budget")
+        for plan in spilled:
+            self.assertTrue(plan.too_long, plan.new_name)
+
+        result = renamer.apply_renames(plans, write_log=False)
+        for plan in spilled:
+            self.assertTrue(plan.photo.path.exists())        # left where it was
+            self.assertNotIn(plan.new_name, [new for _old, new in result.renamed])
+
     def test_a_folder_that_is_already_too_deep_is_refused_not_half_renamed(self):
         write_jpeg(self.dir / "IMG_0001.jpg", exif_date="2026:06:12 14:22:33")
         files, _ = renamer.scan_paths([self.dir])

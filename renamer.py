@@ -78,7 +78,9 @@ MAX_PATH_USABLE = MAX_PATH - 1
 # Most file systems also cap a single name at 255 characters.
 MAX_NAME = 255
 # Head-room kept free so the " (1)" de-duplication suffix always still fits.
-DEDUPE_ROOM = 6
+# Seven characters, which covers everything up to " (9999)". Past that the
+# planner re-checks the finished name rather than trusting this number.
+DEDUPE_ROOM = 7
 
 
 # --------------------------------------------------------------------------
@@ -1169,6 +1171,12 @@ def plan_renames(files: list[PhotoFile], settings: RenameSettings, *,
             candidate = f"{stem} ({counter}){ext}"
             lowered = candidate.lower()
             counter += 1
+        if conflict:
+            # DEDUPE_ROOM only reserves enough for " (9999)". Past that the
+            # suffix eats into the path budget, so check the *finished* name
+            # and refuse honestly instead of handing Windows a path it will
+            # reject halfway through the batch.
+            too_long = too_long or len(str(directory / candidate)) > MAX_PATH_USABLE
         taken_here.add(lowered)
         plans.append(RenamePlan(photo=photo, new_name=candidate, conflict=conflict,
                                 truncated=truncated and not too_long,
