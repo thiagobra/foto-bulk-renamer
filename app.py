@@ -1536,6 +1536,26 @@ class FotoRenamer:
         out = re.sub(r"[_-]\{place\}", "", out)
         return out.strip("_-")
 
+    @staticmethod
+    def _glue_beside(pattern: str, *, first: bool) -> str:
+        """The separator next to the pattern's first (or last) token, or "_".
+
+        The dropdown is documented as a shortcut for dragging {place}, and a
+        drag reuses the slot it lands in — reorder_tokens moves tokens, never
+        glue. Forcing "_" in here rewrites a hyphenated pattern's separator,
+        and taking {place} back out again cannot restore it.
+        """
+        segments = renamer.split_pattern(pattern)
+        slots = [i for i, seg in enumerate(segments) if seg.is_token]
+        if not slots:
+            return "_"
+        neighbour = slots[0] + 1 if first else slots[-1] - 1
+        if 0 <= neighbour < len(segments) and not segments[neighbour].is_token:
+            for ch in segments[neighbour].text:
+                if ch in "-_":
+                    return ch
+        return "_"
+
     def _apply_place_position(self) -> None:
         """Rewrite the pattern so {place} sits where the dropdown says.
 
@@ -1547,14 +1567,22 @@ class FotoRenamer:
         base = self._pattern_without_place(self.var_pattern.get())
         choice = self.var_place_at.get()
         if choice == "After the date":
-            pattern, swapped = re.subn(r"(\{date8?\})", r"\1_{place}",
-                                       base, count=1)
+            # Capture the separator that already follows {date} and use it on
+            # both sides, so "{date}-{event}" gains "{date}-{place}-{event}"
+            # and not a hyphen the round trip can never put back.
+            pattern, swapped = re.subn(
+                r"(\{date8?\})([_-]?)",
+                lambda m: f"{m.group(1)}{m.group(2) or '_'}{{place}}{m.group(2)}",
+                base, count=1)
             if not swapped:              # no date token to sit after
-                pattern = f"{{place}}_{base}" if base else "{place}"
+                pattern = (f"{{place}}{self._glue_beside(base, first=True)}{base}"
+                           if base else "{place}")
         elif choice == "Beginning":
-            pattern = f"{{place}}_{base}" if base else "{place}"
+            pattern = (f"{{place}}{self._glue_beside(base, first=True)}{base}"
+                       if base else "{place}")
         elif choice == "End (suffix)":
-            pattern = f"{base}_{{place}}" if base else "{place}"
+            pattern = (f"{base}{self._glue_beside(base, first=False)}{{place}}"
+                       if base else "{place}")
         elif choice == PLACE_CUSTOM:
             # You dragged it somewhere the dropdown has no word for. Leave it
             # exactly there; only put it back if a preset has just wiped it out.

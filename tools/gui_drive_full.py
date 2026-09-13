@@ -465,6 +465,31 @@ def sc_place_panel():
         check(f"Position {position!r} rewrites the pattern ({a.var_pattern.get()})",
               a.var_pattern.get() == expected, a.var_pattern.get())
 
+    # The dropdown is a shortcut for dragging {place}, and a drag never moves
+    # glue — so it must reuse the pattern's own separator rather than forcing
+    # "_". Forcing it made "After the date" destructive: turning Place back Off
+    # stripped "{place}-" and the hyphen was gone for good.
+    hyphenated = "IMG_{date}-{event}_{n}"
+    for position in ("Beginning", "Off", "End (suffix)", "Off",
+                     "After the date", "Off"):
+        if position == "Beginning":
+            a.var_pattern.set(hyphenated)
+        a.var_place_at.set(position); a._on_place_position_change(); pump(a.root)
+        if position == "After the date":
+            check("Position 'After the date' keeps a hyphenated separator",
+                  a.var_pattern.get() == "IMG_{date}-{place}-{event}_{n}",
+                  a.var_pattern.get())
+    check("a hyphenated pattern survives Place on/off in all three positions",
+          a.var_pattern.get() == hyphenated, a.var_pattern.get())
+
+    a.var_pattern.set("{event}-{n}")                 # the web_slug preset
+    a.var_place_at.set("End (suffix)"); a._on_place_position_change(); pump(a.root)
+    check("a web slug gains the place with a hyphen, not an underscore",
+          a.var_pattern.get() == "{event}-{n}-{place}", a.var_pattern.get())
+
+    a.var_pattern.set("{date}_{event}_{n}")          # back to where we were
+    a.var_place_at.set("Off"); a._on_place_position_change(); pump(a.root)
+
     a.var_place_at.set("End (suffix)"); a._on_place_position_change(); pump(a.root)
     a.var_city.set(""); a._add_stay(); pump(a.root)
     check("a stay with no city is refused with a readable reason",
