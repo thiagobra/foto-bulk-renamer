@@ -1268,6 +1268,20 @@ def _two_phase_move(moves: list[tuple[Path, Path]]) -> RenameResult:
                 result.errors.append(
                     (original.name, f"is currently named {temp.name}"))
             continue
+        if dst.exists():
+            # Phase 1 parked every file in this batch under a temp name, so
+            # anything still standing here arrived from outside the batch —
+            # created or moved there since the preview was built. POSIX
+            # rename() would replace it without a word, and on an undo it
+            # would be the very name the user asked us to restore.
+            result.errors.append(
+                (original.name, f"{dst.name} already exists — left it alone"))
+            try:
+                temp.rename(original)
+            except OSError:
+                result.errors.append(
+                    (original.name, f"is currently named {temp.name}"))
+            continue
         try:
             temp.rename(dst)
             result.renamed.append((original.name, dst.name))

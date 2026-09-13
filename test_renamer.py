@@ -1100,6 +1100,67 @@ class TestCaseOnlyRename(unittest.TestCase):
         self.assertEqual([p.name for p in self.dir.iterdir()], ["IMG_0001.JPG"])
 
 
+class TestABystanderIsNeverOverwritten(unittest.TestCase):
+    """Planning is pure and runs before anything touches disk, so a file can
+    turn up at a target name in between. POSIX rename() would replace it
+    without a word and Windows would raise mid-batch, so the mover refuses.
+
+    After phase 1 every file in the batch is parked under a temp name, which
+    is what makes "the target still exists" mean "this one is not ours".
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        for spent in renamer.history_dir().glob("*.json"):
+            spent.unlink()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+        for spent in renamer.history_dir().glob("*.json*"):
+            spent.unlink()
+
+    def _rename_one(self):
+        write_jpeg(self.dir / "IMG_0001.jpg", exif_date="2026:06:12 14:22:33")
+        files, _ = renamer.scan_paths([self.dir])
+        return renamer.plan_renames(files, RenameSettings(event="beach"))
+
+    def _temps(self):
+        return [p.name for p in self.dir.iterdir() if renamer.TEMP_SUFFIX in p.name]
+
+    def test_a_file_that_appeared_at_the_target_survives_the_rename(self):
+        plans = self._rename_one()
+        target = plans[0].target
+        target.write_bytes(b"NOT OURS")           # arrived after the preview
+
+        result = renamer.apply_renames(plans)
+
+        self.assertEqual(target.read_bytes(), b"NOT OURS")
+        self.assertEqual(result.renamed, [])
+        self.assertTrue(any("already exists" in why for _name, why in result.errors))
+        self.assertTrue((self.dir / "IMG_0001.jpg").exists())
+        self.assertEqual(self._temps(), [])
+
+    def test_an_undo_refuses_to_overwrite_a_reoccupied_old_name(self):
+        renamer.apply_renames(self._rename_one())
+        old = self.dir / "IMG_0001.jpg"
+        old.write_bytes(b"NOT OURS")              # put back there by hand
+
+        result = renamer.undo_last()
+
+        self.assertEqual(old.read_bytes(), b"NOT OURS")
+        self.assertEqual(result.renamed, [])
+        self.assertTrue(any("already exists" in why for _name, why in result.errors))
+        self.assertIsNotNone(renamer.last_log())  # still there to retry
+        self.assertEqual(self._temps(), [])
+
+        old.unlink()                              # now the name is free
+        again = renamer.undo_last()
+        self.assertEqual(len(again.renamed), 1)
+        self.assertTrue(old.exists())
+        self.assertIsNone(renamer.last_log())     # only now is it spent
+
+
 class TestUndoDurability(unittest.TestCase):
     """The undo log is the user's only way back. Losing it is the worst bug
     this program could have, so a failed undo must not consume it."""
